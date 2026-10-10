@@ -11,7 +11,7 @@ with the "Pending" item under *Optimisation analysis*. Returnal was left in `mod
 ## Tools
 
 - `tools/bench.sh mode <vanilla|mod|mod-nopanel> "<Win64 dir>"` switches the setup (game closed):
-  - `vanilla` renames `version.dll` to `.off`, so GyroUE isn't loaded and settings are kept;
+  - `vanilla` renames the GyroUE proxy (`winmm.dll` or `version.dll`) to `.off`, so GyroUE isn't loaded and settings are kept;
   - `mod` is GyroUE with the F10 panel hooks (`ui.menu_key=F10`);
   - `mod-nopanel` is GyroUE with no graphics hooks (`ui.menu_key=` empty, `ui.gamepad_menu_shortcut=0`).
 - `tools/bench.sh capture <label> <process.exe>` starts PresentMon 2.6 (`--qpc_time --v1_metrics`) for the whole

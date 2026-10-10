@@ -1,5 +1,5 @@
 ; Exports of every system DLL GyroUE can stand in for (see proxy.cpp). The DLL works under either name.
-LIBRARY version
+LIBRARY winmm
 EXPORTS
     ; version.dll
     GetFileVersionInfoA=proxy_GetFileVersionInfoA

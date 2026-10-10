@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Configures (if needed) and builds GyroUE (version.dll) against the pinned GyroLib SDK.
+# Configures (if needed) and builds GyroUE (winmm.dll) against the pinned GyroLib SDK.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$ROOT/tools/gyrolib-sdk.sh"

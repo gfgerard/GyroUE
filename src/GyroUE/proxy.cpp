@@ -1,6 +1,7 @@
-// System DLL proxy. GyroUE ships as version.dll, but some games don't import version.dll (or another
-// mod already owns that name), so the same DLL also exports all of winmm.dll and can be renamed to
-// winmm.dll. Every export forwards to %SystemRoot%\System32\<this DLL's own file name>; an export the
+// System DLL proxy. GyroUE ships as winmm.dll (imported by more games than version.dll), but some
+// games or tools load the system winmm.dll first (RivaTuner's hooks in Gears of War: E-Day), or another
+// mod already owns that name, so the same DLL also exports all of version.dll and can be renamed to
+// version.dll. Every export forwards to %SystemRoot%\System32\<this DLL's own file name>; an export the
 // real DLL doesn't have fails with ERROR_PROC_NOT_FOUND (nobody imports it under that name anyway).
 // All version.dll and winmm.dll functions take at most 8 integer/pointer arguments (no floats), so one
 // generic x64 forwarder signature covers them (extra slots read harmlessly from the caller's frame).

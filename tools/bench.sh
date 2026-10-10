@@ -3,7 +3,7 @@
 #   bash tools/bench.sh mode <vanilla|mod|mod-nopanel> <Win64 dir>   switch setup (game closed)
 #   bash tools/bench.sh capture <label> <process.exe>                record; Ctrl+Shift+F9 marks start/stop
 #   bash tools/bench.sh report [dir]                                 summary table of bench/*.csv
-# Modes: vanilla = version.dll renamed to .off (GyroUE not loaded, settings kept)
+# Modes: vanilla = the GyroUE proxy (winmm.dll or version.dll) renamed to .off (GyroUE not loaded, settings kept)
 #        mod = GyroUE with the F10 panel hooks; mod-nopanel = GyroUE without any graphics hooks.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,14 +14,16 @@ case "$cmd" in
 mode)
   m="${1:?vanilla|mod|mod-nopanel}"; W="${2:?Win64 dir}"; ini="$W/GyroUE/gyrolib.ini"
   case "$m" in
-    vanilla) [ -f "$W/version.dll" ] && mv "$W/version.dll" "$W/version.dll.off" ;;
+    vanilla) for p in winmm.dll version.dll; do
+               if grep -aqs "GyroUE " "$W/$p"; then mv "$W/$p" "$W/$p.off"; fi
+             done ;;
     mod|mod-nopanel)
-      [ -f "$W/version.dll.off" ] && mv "$W/version.dll.off" "$W/version.dll"
+      for p in winmm.dll version.dll; do if [ -f "$W/$p.off" ]; then mv "$W/$p.off" "$W/$p"; fi; done
       if [ "$m" = mod ]; then sed -i 's/^ui\.menu_key=.*/ui.menu_key=F10/' "$ini"
       else sed -i 's/^ui\.menu_key=.*/ui.menu_key=/; s/^ui\.gamepad_menu_shortcut=.*/ui.gamepad_menu_shortcut=0/' "$ini"; fi ;;
     *) echo "unknown mode $m"; exit 1 ;;
   esac
-  echo "mode $m: $(ls "$W" | grep -E '^version\.dll' | tr '\n' ' ')$(grep -E '^ui\.(menu_key|gamepad)' "$ini" 2>/dev/null | tr '\n' ' ')" ;;
+  echo "mode $m: $(ls "$W" | grep -E '^(winmm|version)\.dll' | tr '\n' ' ')$(grep -E '^ui\.(menu_key|gamepad)' "$ini" 2>/dev/null | tr '\n' ' ')" ;;
 capture)
   [ -n "$PM" ] && [ -f "$PM" ] || { echo "PresentMon not found: install it or set PRESENTMON=<path to PresentMon-*-x64.exe>"; exit 1; }
   # PresentMon records the whole session with QPC timestamps; bench_marker.py stores the QPC of each

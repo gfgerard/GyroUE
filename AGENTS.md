@@ -77,8 +77,9 @@ Key rules from the review:
 - Python 3.13 and uv are available for helper scripts. git is available; gh is not.
 - Build GyroUE: `bash tools/build-gyroue.sh`. Build + release zip: `bash tools/package-gyroue.sh` (see
   "Releases" below). Install into any UE game:
-  `bash tools/deploy-gyroue.sh "<game>\<Project>\Binaries\Win64" [remove]` (prefix `PROXY=winmm.dll` to
-  install under that name when the game doesn't load `version.dll` or another mod owns it).
+  `bash tools/deploy-gyroue.sh "<game>\<Project>\Binaries\Win64" [remove]` (installs `winmm.dll`; prefix
+  `PROXY=version.dll` to install under that name when `winmm.dll` doesn't load or another mod owns it; Gears of War:
+  E-Day needs `version.dll`).
   Sensor test tool: `tools/gyroprobe` (`gyroprobe.exe [seconds]`, `--settings`).
 - Performance: `bench/BENCHMARKS.md` (method, results, optimisation analysis); tools `tools/bench.sh`
   (modes vanilla / mod / mod-nopanel, PresentMon capture with Ctrl+Shift+F9 marks, report).
@@ -94,9 +95,9 @@ Every time you build a new version of GyroUE, also produce its release zip:
 1. Bump the version in `project(GyroUE VERSION x.y.z ...)` in `src/GyroUE/CMakeLists.txt`. That is the
    only place it lives: the DLL's log line (`GyroUE x.y.z in ...`) and the zip name both come from it.
    Never hard-code the version anywhere else.
-2. Run `bash tools/package-gyroue.sh`. It builds, checks that `version.dll` carries that exact version,
+2. Run `bash tools/package-gyroue.sh`. It builds, checks that `winmm.dll` carries that exact version,
    and writes `build/release/GyroUE-v<version>.zip`. Extract the zip into a game's
-   `<Project>\Binaries\Win64` folder: `version.dll` plus `GyroUE\` (`gyrolib.dll`, all `profiles/`,
+   `<Project>\Binaries\Win64` folder: `winmm.dll` plus `GyroUE\` (`gyrolib.dll`, all `profiles/`,
    `licenses/`, `README.md`, `TROUBLESHOOTING.md`, `ADVANCED.md`, `CREDITS.md`). It ships no `gyrolib.ini` or `GyroUE.ini` (both created on first run), so users keep
    their settings when they update.
 3. Record the new version and what changed in `MODLOG.md`.

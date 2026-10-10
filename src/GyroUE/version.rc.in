@@ -20,7 +20,7 @@ BEGIN
             VALUE "FileVersion",      "@PROJECT_VERSION@"
             VALUE "ProductVersion",   "@PROJECT_VERSION@"
             VALUE "InternalName",     "GyroUE"
-            VALUE "OriginalFilename", "version.dll"
+            VALUE "OriginalFilename", "winmm.dll"
             VALUE "LegalCopyright",   "MIT License"
         END
     END

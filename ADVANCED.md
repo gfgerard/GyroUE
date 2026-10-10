@@ -5,7 +5,7 @@ play.
 
 ## Technical features
 
-- **Drop-in install:** one proxy `version.dll` plus a `GyroUE` folder next to the game executable. No loader
+- **Drop-in install:** one proxy `winmm.dll` (or `version.dll`) plus a `GyroUE` folder next to the game executable. No loader
   (UE4SS etc.) required.
 - **Signature-free engine access:** GUObjectArray, FNamePool and the UStruct/FProperty layout are found at
   runtime by shape and verified against known engine classes, so no per-game byte patterns are needed.
@@ -34,7 +34,7 @@ play.
 | Pacific Drive | UE 4.27 | yes | On foot uses the generic path. In the car the gyro drives the car camera and overrides the auto-recentering while driving. |
 | Returnal | UE 4.25 (modular build) | no | Generic path working OOB. A good setup is gyro on while L2/R2 is held |
 | Cronos: The New Dawn | UE 5.4 | yes | The camera ignores `ControlRotation`; the profile writes the look rotation inside the pawn's `View` component. Panel verified with HDR + RenoDX. |
-| Gears of War: E-Day | UE 5.6 (Xbox / Game Pass build) | no | Generic path, campaign tested *WITH EAC DISABLED*. Install in `Binaries\WinGDK` as `version.dll`. Protected exe: GyroUE switches to inline hooks and finds the engine objects with a heap scan, so the gyro becomes available a few seconds after the main menu appears. The game ships EasyAntiCheat: don't use GyroUE in online modes. |
+| Gears of War: E-Day | UE 5.6 (Xbox / Game Pass build) | no | Generic path, campaign tested *WITH EAC DISABLED*. Install in `Binaries\WinGDK` renamed to `version.dll` (with RivaTuner running, the game loads the system `winmm.dll` first). Protected exe: GyroUE switches to inline hooks and finds the engine objects with a heap scan, so the gyro becomes available a few seconds after the main menu appears. The game ships EasyAntiCheat: don't use GyroUE in online modes. |
 | Life is Strange Remastered | UE 4 (pre-4.25 property system), DX11 | yes (shipped) | Found with the camera probe. The camera splits pitch and yaw across two raw rotators, and the walking camera blends back to an automatic follow camera unless it gets look input; the profile writes `OnGyro=` to keep it manual. No settings panel (DX11): configure via `gyrolib.ini`. |
 | Luto | UE 5.5.4 | no | Generic path working OOB |
 
@@ -46,9 +46,9 @@ Tested with a DualSense over USB/BT and Nintendo Switch Pro Controller. Requirem
   BattlEye or any online-protected game.
 - UE 4 and UE 5. Both property systems are detected at runtime: FField (UE 4.25+, UE 5) and the older UProperty
   objects (tested with Life is Strange Remastered).
-- The game must not already use a `version.dll` proxy. If it does (or the game doesn't load `version.dll`),
-  rename GyroUE's `version.dll` to `winmm.dll`: the same DLL works under both names. The installer refuses to
-  overwrite a foreign proxy.
+- GyroUE ships as `winmm.dll`, which more games import than `version.dll`. If the game already has a `winmm.dll`
+  proxy from another mod, or GyroUE doesn't load (no log), rename it to `version.dll`: the same DLL works under both
+  names. The installer refuses to overwrite a foreign proxy.
 - Close other pad remappers (DS4Windows, DSX, reWASD) while playing. If Steam Input is enabled for the game,
   check that Steam isn't also converting the gyro to mouse, or the motion will be doubled.
 
@@ -58,8 +58,8 @@ All diagnostics go to `GyroUE\GyroUE.log` (probe results, if enabled, to `GyroUE
 
 | Symptom | Check |
 |---|---|
-| No log file | `version.dll` is not next to the game exe (it must be in `Binaries\Win64` or `Binaries\WinGDK`), another mod's `version.dll` replaced it, or the game doesn't load `version.dll` (e.g. Xbox/GDK builds): rename it to `winmm.dll`. |
-| "Entry point `timeGetDevCaps` not found" | A GyroUE older than 0.4.7 renamed to `winmm.dll`. Update: 0.4.7+ exports winmm too. |
+| No log file | `winmm.dll` is not next to the game exe (it must be in `Binaries\Win64` or `Binaries\WinGDK`), another mod's `winmm.dll` replaced it, or the system `winmm.dll` was loaded first (e.g. by RivaTuner's hooks, seen in Gears of War: E-Day): rename it to `version.dll`. |
+| "Entry point `timeGetDevCaps` not found" | A GyroUE older than 0.4.7 named `winmm.dll`. Update: 0.4.7+ exports winmm too. |
 | `motion=0` in the status line | The controller isn't visible to SDL: close remappers, try USB, check Steam Input. |
 | `view=none` in gameplay | The pawn is missing or a placeholder. The game may need a profile. |
 | `applied yaw` changes but the camera doesn't move | Custom camera: see [Finding the camera](#finding-the-camera-of-a-new-game). |
@@ -80,8 +80,8 @@ DualSense --HID--> SDL3 (inside gyrolib.dll)
                 apply   -> profile view rotation += delta  (default: ControlRotation)
 ```
 
-- `version.dll` is a proxy for the system DLL of the same name. It also exports all of `winmm.dll`, so it can be
-  renamed to `winmm.dll`; either way every export is forwarded to the System32 DLL with its own file name, so the
+- `winmm.dll` is a proxy for the system DLL of the same name. It also exports all of `version.dll`, so it can be
+  renamed to `version.dll`; either way every export is forwarded to the System32 DLL with its own file name, so the
   game behaves normally. 
 - The per-frame hook is an import-table patch of `PeekMessageW`. Unreal pumps window messages on the game
   thread once per frame, which is a safe place to read and write game objects. The game's own code is never
@@ -382,7 +382,7 @@ Requirements:
   `tools/gyrolib-sdk.sh`.
 
 ```bash
-bash tools/build-gyroue.sh      # -> build/GyroUE/Release/version.dll
+bash tools/build-gyroue.sh      # -> build/GyroUE/Release/winmm.dll
 bash tools/package-gyroue.sh    # build + build/release/GyroUE-v<version>.zip (installable release)
 ```
 

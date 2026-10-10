@@ -51,14 +51,14 @@ More:
    | Pacific Drive | `Pacific Drive\PenDriverPro\Binaries\Win64` |
    | Cronos: The New Dawn | `...\Cronos\Binaries\Win64` |
    | Life is Strange Remastered | `...\LIS\Binaries\Win64` |
-   | Gears of War: E-Day (Game Pass) | `...\Content\FairlightConcept\Binaries\WinGDK` |
+   | Gears of War: E-Day (Game Pass) | `...\Content\FairlightConcept\Binaries\WinGDK` (rename `winmm.dll` to `version.dll`, see the note below) |
 
 3. **Extract the zip into that folder.** You should end up with:
 
    ```text
    Binaries\Win64\
    ├── <Game>-Win64-Shipping.exe     (the game's exe, already there)
-   ├── version.dll                   ← GyroUE
+   ├── winmm.dll                     ← GyroUE
    └── GyroUE\                       ← GyroUE folder (settings, profiles, log)
    ```
 
@@ -66,9 +66,9 @@ More:
    for the settings panel.
 
 > [!NOTE]
-> **Nothing happens?** Another mod may already use a `version.dll`, or the game doesn't load it (.log and .ini 
-files should appear inside the **GyroUE** folder).
-> Rename GyroUE's `version.dll` to **`winmm.dll`** (it works under both names) and try again.
+> **Nothing happens?** Another mod may already use a `winmm.dll`, or another program (e.g. RivaTuner) makes the
+> game load the Windows one first (.log and .ini files should appear inside the **GyroUE** folder).
+> Rename GyroUE's `winmm.dll` to **`version.dll`** (it works under both names) and try again.
 
 #### Update
 
@@ -77,7 +77,7 @@ are kept.
 
 #### Uninstall
 
-Delete `version.dll` (or `winmm.dll` if you renamed it) and the `GyroUE` folder. Nothing else was
+Delete `winmm.dll` (or `version.dll` if you renamed it) and the `GyroUE` folder. Nothing else was
 changed.
 
 ## Using it

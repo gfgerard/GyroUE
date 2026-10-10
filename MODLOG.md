@@ -734,6 +734,14 @@ UE4SS C++ mod built on GyroLib and no per-game code in the common case. Design b
     samples/s for the Switch Pro. Steam Input's implementation is closed source and can't be compared. The closest open
     references are SDL's HIDAPI Switch driver and JoyShockMapper/GamepadMotionHelpers.
 
+- 2026-10-10 **GyroUE 0.6.18: ships as `winmm.dll` by default, `version.dll` is the fallback name** (user: winmm has
+  wider support to start with). Build output, version resource OriginalFilename and `proxy.def` LIBRARY are now winmm;
+  the DLL still exports both sets and forwards by its own file name, so nothing changes at runtime. `deploy-gyroue.sh`
+  defaults to `winmm.dll` (`PROXY=version.dll` for the fallback; Gears of War: E-Day needs it, see 2026-10-09: with
+  RTSS running the system winmm.dll is loaded first), the release zip holds `winmm.dll`, `bench.sh` handles either name.
+  Docs (README, TROUBLESHOOTING, ADVANCED, AGENTS, CREDITS, BENCHMARKS) updated. Already-installed games keep their
+  current name; the installer removes the other name when redeploying. Not yet run in game.
+
 ## Status summary (2026-10-08)
 - Pacific Drive: **done** (on foot + car profile, in-game panel, calibration). Install:
   `games/PacificDrive/deploy-gyroue.sh "<Win64 dir>"`; uninstall with `remove`. UE4SS is parked as `dwmapi.dll.off`.
@@ -746,7 +754,7 @@ UE4SS C++ mod built on GyroLib and no per-game code in the common case. Design b
   walking camera), user-verified 2026-10-09. First DX11 game and first pre-4.25 property system.
 - Gears of War: E-Day (UE 5.6, Xbox/GDK build, Themida): **works** with the generic view (no profile), user-verified with
   0.5.5 as `version.dll` (2026-10-09). Needs inline hooks, the System32 DXGI factory vtable and the heap scan for
-  GUObjectArray. Install with `bash tools/deploy-gyroue.sh "<...>\Binaries\WinGDK"` (version.dll).
+  GUObjectArray. Install with `PROXY=version.dll bash tools/deploy-gyroue.sh "<...>\Binaries\WinGDK"`.
 
 ## Ideas for later
 

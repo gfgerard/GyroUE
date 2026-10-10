@@ -1,4 +1,4 @@
-// GyroUE entry point. Loaded as version.dll (or winmm.dll, see proxy.cpp) by the game exe (static import, so DllMain runs on the
+// GyroUE entry point. Loaded as winmm.dll (or version.dll, see proxy.cpp) by the game exe (static import, so DllMain runs on the
 // main thread, which in Unreal is the game thread). It patches the game modules' imports of PeekMessageW:
 // Unreal pumps Windows messages on the game thread once per frame, and the call that finds the
 // queue empty marks the end of that pump, which is where the gyro frame runs.

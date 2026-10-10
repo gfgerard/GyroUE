@@ -46,7 +46,7 @@ GyroLib SDK (`share/doc/GyroLib/licenses/`) and ship in every GyroUE release und
 | stb by Sean Barrett | MIT / public domain | `STB-LICENSE.txt` |
 | GyroLib | MIT | `LICENSE` |
 
-GyroUE's own license is included in the same folder as `GyroUE-LICENSE.txt`. `version.dll` statically links
+GyroUE's own license is included in the same folder as `GyroUE-LICENSE.txt`. GyroUE's proxy DLL (`winmm.dll`) statically links
 [MinHook](https://github.com/TsudaKageyu/minhook) 1.3.4 (BSD-2-Clause, includes Hacker Disassembler Engine by
 Vyacheslav Patkov); its notice ships as `MinHook-LICENSE.txt`.
 

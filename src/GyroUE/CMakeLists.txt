@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(GyroUE VERSION 0.6.17 LANGUAGES C CXX)  # the one place the GyroUE version lives (DLL log line + release zip name)
+project(GyroUE VERSION 0.6.18 LANGUAGES C CXX)  # the one place the GyroUE version lives (DLL log line + release zip name)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")  # static CRT: one less DLL to ship
 
@@ -16,12 +16,12 @@ target_include_directories(minhook PUBLIC "${MINHOOK_DIR}/include")
 configure_file(version.rc.in "${CMAKE_CURRENT_BINARY_DIR}/version.rc" @ONLY)
 add_library(GyroUE SHARED dllmain.cpp proxy.cpp host.cpp hooks.cpp overlay.cpp perf.cpp ue.cpp log.cpp notify.cpp proxy.def
             "${CMAKE_CURRENT_BINARY_DIR}/version.rc")
-set_target_properties(GyroUE PROPERTIES OUTPUT_NAME version)
+set_target_properties(GyroUE PROPERTIES OUTPUT_NAME winmm)
 target_compile_definitions(GyroUE PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE "GYROUE_VERSION=\"${PROJECT_VERSION}\"")
 target_compile_options(GyroUE PRIVATE /W4 /permissive- /utf-8)
 target_link_libraries(GyroUE PRIVATE GyroLib::gyrolib_sdl minhook delayimp dxguid)
 # gyrolib.dll lives in the GyroUE subfolder and is loaded by full path before first use.
 target_link_options(GyroUE PRIVATE /DELAYLOAD:gyrolib.dll)
-# Symbols for crash dumps (build/GyroUE/Release/version.pdb; never shipped). /OPT keeps the release layout.
+# Symbols for crash dumps (build/GyroUE/Release/winmm.pdb; never shipped). /OPT keeps the release layout.
 target_compile_options(GyroUE PRIVATE /Zi)
 target_link_options(GyroUE PRIVATE /DEBUG /OPT:REF /OPT:ICF)
