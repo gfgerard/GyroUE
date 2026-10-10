@@ -1,0 +1,246 @@
+// System DLL proxy. GyroUE ships as version.dll, but some games don't import version.dll (or another
+// mod already owns that name), so the same DLL also exports all of winmm.dll and can be renamed to
+// winmm.dll. Every export forwards to %SystemRoot%\System32\<this DLL's own file name>; an export the
+// real DLL doesn't have fails with ERROR_PROC_NOT_FOUND (nobody imports it under that name anyway).
+// All version.dll and winmm.dll functions take at most 8 integer/pointer arguments (no floats), so one
+// generic x64 forwarder signature covers them (extra slots read harmlessly from the caller's frame).
+#include <windows.h>
+
+namespace {
+
+using Fn = INT_PTR(WINAPI*)(INT_PTR, INT_PTR, INT_PTR, INT_PTR, INT_PTR, INT_PTR, INT_PTR, INT_PTR);
+
+HMODULE real_module() {
+    static HMODULE module = [] {
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&real_module), &self);
+        wchar_t own[MAX_PATH];
+        GetModuleFileNameW(self, own, MAX_PATH);
+        const wchar_t* name = own;
+        for (const wchar_t* c = own; *c; ++c)
+            if (*c == L'\\' || *c == L'/') name = c + 1;
+        wchar_t path[MAX_PATH];
+        const UINT n = GetSystemDirectoryW(path, MAX_PATH);
+        path[n] = L'\\';
+        lstrcpynW(path + n + 1, name, MAX_PATH - int(n) - 1);
+        return LoadLibraryW(path);  // full path: the system copy, not this proxy
+    }();
+    return module;
+}
+
+Fn resolve(const char* name) { return reinterpret_cast<Fn>(GetProcAddress(real_module(), name)); }
+
+}  // namespace
+
+#define GYROUE_FORWARD(name)                                                                            \
+    extern "C" INT_PTR WINAPI proxy_##name(INT_PTR a, INT_PTR b, INT_PTR c, INT_PTR d, INT_PTR e, INT_PTR f, \
+                                           INT_PTR g, INT_PTR h) {                                        \
+        static const Fn real = resolve(#name);                                                            \
+        if (!real) {                                                                                      \
+            SetLastError(ERROR_PROC_NOT_FOUND);                                                           \
+            return 0;                                                                                     \
+        }                                                                                                 \
+        return real(a, b, c, d, e, f, g, h);                                                              \
+    }
+
+// version.dll
+GYROUE_FORWARD(GetFileVersionInfoA)
+GYROUE_FORWARD(GetFileVersionInfoByHandle)
+GYROUE_FORWARD(GetFileVersionInfoExA)
+GYROUE_FORWARD(GetFileVersionInfoExW)
+GYROUE_FORWARD(GetFileVersionInfoSizeA)
+GYROUE_FORWARD(GetFileVersionInfoSizeExA)
+GYROUE_FORWARD(GetFileVersionInfoSizeExW)
+GYROUE_FORWARD(GetFileVersionInfoSizeW)
+GYROUE_FORWARD(GetFileVersionInfoW)
+GYROUE_FORWARD(VerFindFileA)
+GYROUE_FORWARD(VerFindFileW)
+GYROUE_FORWARD(VerInstallFileA)
+GYROUE_FORWARD(VerInstallFileW)
+GYROUE_FORWARD(VerLanguageNameA)
+GYROUE_FORWARD(VerLanguageNameW)
+GYROUE_FORWARD(VerQueryValueA)
+GYROUE_FORWARD(VerQueryValueW)
+
+// winmm.dll
+GYROUE_FORWARD(CloseDriver)
+GYROUE_FORWARD(DefDriverProc)
+GYROUE_FORWARD(DriverCallback)
+GYROUE_FORWARD(DrvGetModuleHandle)
+GYROUE_FORWARD(GetDriverModuleHandle)
+GYROUE_FORWARD(OpenDriver)
+GYROUE_FORWARD(PlaySound)
+GYROUE_FORWARD(PlaySoundA)
+GYROUE_FORWARD(PlaySoundW)
+GYROUE_FORWARD(SendDriverMessage)
+GYROUE_FORWARD(WOWAppExit)
+GYROUE_FORWARD(auxGetDevCapsA)
+GYROUE_FORWARD(auxGetDevCapsW)
+GYROUE_FORWARD(auxGetNumDevs)
+GYROUE_FORWARD(auxGetVolume)
+GYROUE_FORWARD(auxOutMessage)
+GYROUE_FORWARD(auxSetVolume)
+GYROUE_FORWARD(joyConfigChanged)
+GYROUE_FORWARD(joyGetDevCapsA)
+GYROUE_FORWARD(joyGetDevCapsW)
+GYROUE_FORWARD(joyGetNumDevs)
+GYROUE_FORWARD(joyGetPos)
+GYROUE_FORWARD(joyGetPosEx)
+GYROUE_FORWARD(joyGetThreshold)
+GYROUE_FORWARD(joyReleaseCapture)
+GYROUE_FORWARD(joySetCapture)
+GYROUE_FORWARD(joySetThreshold)
+GYROUE_FORWARD(mciDriverNotify)
+GYROUE_FORWARD(mciDriverYield)
+GYROUE_FORWARD(mciExecute)
+GYROUE_FORWARD(mciFreeCommandResource)
+GYROUE_FORWARD(mciGetCreatorTask)
+GYROUE_FORWARD(mciGetDeviceIDA)
+GYROUE_FORWARD(mciGetDeviceIDFromElementIDA)
+GYROUE_FORWARD(mciGetDeviceIDFromElementIDW)
+GYROUE_FORWARD(mciGetDeviceIDW)
+GYROUE_FORWARD(mciGetDriverData)
+GYROUE_FORWARD(mciGetErrorStringA)
+GYROUE_FORWARD(mciGetErrorStringW)
+GYROUE_FORWARD(mciGetYieldProc)
+GYROUE_FORWARD(mciLoadCommandResource)
+GYROUE_FORWARD(mciSendCommandA)
+GYROUE_FORWARD(mciSendCommandW)
+GYROUE_FORWARD(mciSendStringA)
+GYROUE_FORWARD(mciSendStringW)
+GYROUE_FORWARD(mciSetDriverData)
+GYROUE_FORWARD(mciSetYieldProc)
+GYROUE_FORWARD(midiConnect)
+GYROUE_FORWARD(midiDisconnect)
+GYROUE_FORWARD(midiInAddBuffer)
+GYROUE_FORWARD(midiInClose)
+GYROUE_FORWARD(midiInGetDevCapsA)
+GYROUE_FORWARD(midiInGetDevCapsW)
+GYROUE_FORWARD(midiInGetErrorTextA)
+GYROUE_FORWARD(midiInGetErrorTextW)
+GYROUE_FORWARD(midiInGetID)
+GYROUE_FORWARD(midiInGetNumDevs)
+GYROUE_FORWARD(midiInMessage)
+GYROUE_FORWARD(midiInOpen)
+GYROUE_FORWARD(midiInPrepareHeader)
+GYROUE_FORWARD(midiInReset)
+GYROUE_FORWARD(midiInStart)
+GYROUE_FORWARD(midiInStop)
+GYROUE_FORWARD(midiInUnprepareHeader)
+GYROUE_FORWARD(midiOutCacheDrumPatches)
+GYROUE_FORWARD(midiOutCachePatches)
+GYROUE_FORWARD(midiOutClose)
+GYROUE_FORWARD(midiOutGetDevCapsA)
+GYROUE_FORWARD(midiOutGetDevCapsW)
+GYROUE_FORWARD(midiOutGetErrorTextA)
+GYROUE_FORWARD(midiOutGetErrorTextW)
+GYROUE_FORWARD(midiOutGetID)
+GYROUE_FORWARD(midiOutGetNumDevs)
+GYROUE_FORWARD(midiOutGetVolume)
+GYROUE_FORWARD(midiOutLongMsg)
+GYROUE_FORWARD(midiOutMessage)
+GYROUE_FORWARD(midiOutOpen)
+GYROUE_FORWARD(midiOutPrepareHeader)
+GYROUE_FORWARD(midiOutReset)
+GYROUE_FORWARD(midiOutSetVolume)
+GYROUE_FORWARD(midiOutShortMsg)
+GYROUE_FORWARD(midiOutUnprepareHeader)
+GYROUE_FORWARD(midiStreamClose)
+GYROUE_FORWARD(midiStreamOpen)
+GYROUE_FORWARD(midiStreamOut)
+GYROUE_FORWARD(midiStreamPause)
+GYROUE_FORWARD(midiStreamPosition)
+GYROUE_FORWARD(midiStreamProperty)
+GYROUE_FORWARD(midiStreamRestart)
+GYROUE_FORWARD(midiStreamStop)
+GYROUE_FORWARD(mixerClose)
+GYROUE_FORWARD(mixerGetControlDetailsA)
+GYROUE_FORWARD(mixerGetControlDetailsW)
+GYROUE_FORWARD(mixerGetDevCapsA)
+GYROUE_FORWARD(mixerGetDevCapsW)
+GYROUE_FORWARD(mixerGetID)
+GYROUE_FORWARD(mixerGetLineControlsA)
+GYROUE_FORWARD(mixerGetLineControlsW)
+GYROUE_FORWARD(mixerGetLineInfoA)
+GYROUE_FORWARD(mixerGetLineInfoW)
+GYROUE_FORWARD(mixerGetNumDevs)
+GYROUE_FORWARD(mixerMessage)
+GYROUE_FORWARD(mixerOpen)
+GYROUE_FORWARD(mixerSetControlDetails)
+GYROUE_FORWARD(mmDrvInstall)
+GYROUE_FORWARD(mmGetCurrentTask)
+GYROUE_FORWARD(mmTaskBlock)
+GYROUE_FORWARD(mmTaskCreate)
+GYROUE_FORWARD(mmTaskSignal)
+GYROUE_FORWARD(mmTaskYield)
+GYROUE_FORWARD(mmioAdvance)
+GYROUE_FORWARD(mmioAscend)
+GYROUE_FORWARD(mmioClose)
+GYROUE_FORWARD(mmioCreateChunk)
+GYROUE_FORWARD(mmioDescend)
+GYROUE_FORWARD(mmioFlush)
+GYROUE_FORWARD(mmioGetInfo)
+GYROUE_FORWARD(mmioInstallIOProcA)
+GYROUE_FORWARD(mmioInstallIOProcW)
+GYROUE_FORWARD(mmioOpenA)
+GYROUE_FORWARD(mmioOpenW)
+GYROUE_FORWARD(mmioRead)
+GYROUE_FORWARD(mmioRenameA)
+GYROUE_FORWARD(mmioRenameW)
+GYROUE_FORWARD(mmioSeek)
+GYROUE_FORWARD(mmioSendMessage)
+GYROUE_FORWARD(mmioSetBuffer)
+GYROUE_FORWARD(mmioSetInfo)
+GYROUE_FORWARD(mmioStringToFOURCCA)
+GYROUE_FORWARD(mmioStringToFOURCCW)
+GYROUE_FORWARD(mmioWrite)
+GYROUE_FORWARD(mmsystemGetVersion)
+GYROUE_FORWARD(sndPlaySoundA)
+GYROUE_FORWARD(sndPlaySoundW)
+GYROUE_FORWARD(timeBeginPeriod)
+GYROUE_FORWARD(timeEndPeriod)
+GYROUE_FORWARD(timeGetDevCaps)
+GYROUE_FORWARD(timeGetSystemTime)
+GYROUE_FORWARD(timeGetTime)
+GYROUE_FORWARD(timeKillEvent)
+GYROUE_FORWARD(timeSetEvent)
+GYROUE_FORWARD(waveInAddBuffer)
+GYROUE_FORWARD(waveInClose)
+GYROUE_FORWARD(waveInGetDevCapsA)
+GYROUE_FORWARD(waveInGetDevCapsW)
+GYROUE_FORWARD(waveInGetErrorTextA)
+GYROUE_FORWARD(waveInGetErrorTextW)
+GYROUE_FORWARD(waveInGetID)
+GYROUE_FORWARD(waveInGetNumDevs)
+GYROUE_FORWARD(waveInGetPosition)
+GYROUE_FORWARD(waveInMessage)
+GYROUE_FORWARD(waveInOpen)
+GYROUE_FORWARD(waveInPrepareHeader)
+GYROUE_FORWARD(waveInReset)
+GYROUE_FORWARD(waveInStart)
+GYROUE_FORWARD(waveInStop)
+GYROUE_FORWARD(waveInUnprepareHeader)
+GYROUE_FORWARD(waveOutBreakLoop)
+GYROUE_FORWARD(waveOutClose)
+GYROUE_FORWARD(waveOutGetDevCapsA)
+GYROUE_FORWARD(waveOutGetDevCapsW)
+GYROUE_FORWARD(waveOutGetErrorTextA)
+GYROUE_FORWARD(waveOutGetErrorTextW)
+GYROUE_FORWARD(waveOutGetID)
+GYROUE_FORWARD(waveOutGetNumDevs)
+GYROUE_FORWARD(waveOutGetPitch)
+GYROUE_FORWARD(waveOutGetPlaybackRate)
+GYROUE_FORWARD(waveOutGetPosition)
+GYROUE_FORWARD(waveOutGetVolume)
+GYROUE_FORWARD(waveOutMessage)
+GYROUE_FORWARD(waveOutOpen)
+GYROUE_FORWARD(waveOutPause)
+GYROUE_FORWARD(waveOutPrepareHeader)
+GYROUE_FORWARD(waveOutReset)
+GYROUE_FORWARD(waveOutRestart)
+GYROUE_FORWARD(waveOutSetPitch)
+GYROUE_FORWARD(waveOutSetPlaybackRate)
+GYROUE_FORWARD(waveOutSetVolume)
+GYROUE_FORWARD(waveOutUnprepareHeader)
+GYROUE_FORWARD(waveOutWrite)

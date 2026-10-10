@@ -1,0 +1,17 @@
+dist/
+build/
+third_party/
+*.pak
+*.uasset
+*.uexp
+*.ubulk
+*.dll
+*.pdb
+*.zip
+*.rar
+*.bak
+extract/
+.vs/
+bench/*.csv
+games/
+GyroCamProbe/
