@@ -20,11 +20,31 @@ namespace {
 
 // ---------------------------------------------------------------- guarded memory access
 
+// Only handle what a stray read can cause, and put PAGE_GUARD back. A plausible-looking pointer can land on another
+// thread's stack guard page; swallowing STATUS_GUARD_PAGE_VIOLATION clears the guard, that thread can no longer grow
+// its stack and the game later dies in ntdll (seen in PSButtonsUE, which shares this core: Luto, UE 5.5). Anything
+// else (a real bug) still crashes normally.
+int guard_filter(const EXCEPTION_POINTERS* info) {
+    const EXCEPTION_RECORD* r = info->ExceptionRecord;
+    if (r->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+        if (r->NumberParameters >= 2) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            const auto page = reinterpret_cast<void*>(r->ExceptionInformation[1] & ~uintptr_t(0xFFF));
+            DWORD old = 0;
+            if (VirtualQuery(page, &mbi, sizeof(mbi))) VirtualProtect(page, 1, mbi.Protect | PAGE_GUARD, &old);
+        }
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+    return r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r->ExceptionCode == EXCEPTION_IN_PAGE_ERROR
+               ? EXCEPTION_EXECUTE_HANDLER
+               : EXCEPTION_CONTINUE_SEARCH;
+}
+
 bool guarded_copy(void* dst, uintptr_t src, size_t n) {
     __try {
         std::memcpy(dst, reinterpret_cast<const void*>(src), n);
         return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (guard_filter(GetExceptionInformation())) {
         return false;
     }
 }
@@ -33,7 +53,7 @@ bool guarded_store(uintptr_t dst, const void* src, size_t n) {
     __try {
         std::memcpy(reinterpret_cast<void*>(dst), src, n);
         return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (guard_filter(GetExceptionInformation())) {
         return false;
     }
 }
@@ -271,7 +291,7 @@ void scan_xor_loads(uintptr_t begin, uintptr_t end) {
             if (key == 0) continue;
             add_encoded(begin + i + 7 + intptr_t(disp), key, begin + i);
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (guard_filter(GetExceptionInformation())) {
         ++g_code_faults;
     }
 }
@@ -357,7 +377,7 @@ uintptr_t scan_heap_region(uintptr_t begin, uintptr_t end) {
             if (max < 0x10000 || max_chunks != (max + 65535) / 65536 || num <= 1000 || num > max) continue;
             if (object_array_stride(a) > 0) return a;
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (guard_filter(GetExceptionInformation())) {
     }
     return 0;
 }

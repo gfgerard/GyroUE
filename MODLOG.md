@@ -742,6 +742,18 @@ UE4SS C++ mod built on GyroLib and no per-game code in the common case. Design b
   Docs (README, TROUBLESHOOTING, ADVANCED, AGENTS, CREDITS, BENCHMARKS) updated. Already-installed games keep their
   current name; the installer removes the other name when redeploying. Not yet run in game.
 
+- 2026-10-10 **GyroUE 0.6.19: guarded reads no longer swallow stack guard-page hits** (ported from PSButtonsUE, see its
+  MODLOG "Luto crash with v0.1.0"). `guarded_copy`, `guarded_store`, `scan_xor_loads` and `scan_heap_region` used
+  `__except(EXCEPTION_EXECUTE_HANDLER)`. A stray but plausible pointer landing on another thread's stack guard page raised
+  STATUS_GUARD_PAGE_VIOLATION; swallowing it lets Windows clear PAGE_GUARD, so that thread can't grow its stack and the
+  game later crashes in ntdll (AV at `ntdll+0x12c083`, Windows 11 26100; PSButtonsUE hit it in Luto, UE 5.5.4, while
+  init() retried every 100 ms). New `guard_filter` in `ue.cpp`: on a guard-page violation it re-applies PAGE_GUARD to the
+  faulting page (VirtualQuery + VirtualProtect on `ExceptionInformation[1]`) and handles it; access violations and
+  in-page errors are handled as before; anything else is no longer swallowed (EXCEPTION_CONTINUE_SEARCH). No GyroUE crash
+  was attributed to this yet; it's a latent bug in the shared core. Built with `tools/build-gyroue.sh`, release zip
+  packaged. Deployed to Luto (`D:\Epic\LutoF2kGB\Luto\Binaries\Win64`, `winmm.dll`, replacing 0.6.17; alongside
+  PSButtonsUE 0.1.0 `dsound.dll` and scskiller `d3d12.dll`; generic profile, gyrolib.ini kept). Not run in game yet.
+
 ## Status summary (2026-10-08)
 - Pacific Drive: **done** (on foot + car profile, in-game panel, calibration). Install:
   `games/PacificDrive/deploy-gyroue.sh "<Win64 dir>"`; uninstall with `remove`. UE4SS is parked as `dwmapi.dll.off`.
