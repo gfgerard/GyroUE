@@ -33,7 +33,7 @@ More:
 - Windows 10/11 64-bit.
 - A controller with a gyro. Tested with a **DualSense over USB/BT, Nintendo Switch Pro controller**.
 - Close other controller tools while playing (**DS4Windows, DSX, reWASD**).
-- **Steam Input:** if it's on for the game, you can set in the config panel if you prefer Steam input mouse input to be used.
+- **Steam Input:** if it's on for the game, you can set in the config panel how you prefer Steam input mouse used / not used.
 
 ## Installation / uninstall / update
 
@@ -110,6 +110,7 @@ doesn't follow the gyro, GyroUE tells you on screen, and [Advanced](ADVANCED.md#
 | Life is Strange Remastered | ✅ Works | **No `F10` panel** in this game: change settings in `gyrolib.ini` (see [Using it](#using-it)). |
 | Luto | ✅ Works | |
 | Out of sight | ✅ Works | |
+| Terminator: resistance | ✅ Works | |
 | Gears of War: E-Day (Game Pass) | ⚠️ Campaign only, **with EasyAntiCheat disabled** | Install in `Binaries\WinGDK`. The gyro starts a few seconds after the main menu appears. Never play online with it. |
 
 
