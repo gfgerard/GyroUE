@@ -8,7 +8,7 @@ Unreal Engine.
 **Aim with your controller's gyro in Unreal Engine games on PC.** Turn and tilt your DualSense (or any
 controller with a gyro) and the in-game camera follows, on top of the normal sticks.
 Avoid mixed input conflicts and UI flicker.
-No Steam Input (although compatible), no mouse emulation, no game files changed: drop two files in, delete them to uninstall.
+No Steam Input (although compatible if the game needs it), no mouse emulation, no game files changed: drop two files in, delete them to uninstall.
 
 > [!WARNING]
 > **Experimental.** Tested in the games below; other Unreal Engine 4/5 games often work too, but bugs and
@@ -33,17 +33,18 @@ More:
 - Windows 10/11 64-bit.
 - A controller with a gyro. Tested with a **DualSense over USB/BT, Nintendo Switch Pro controller**.
 - Close other controller tools while playing (**DS4Windows, DSX, reWASD**).
-- **Steam Input:** if it's on for the game, make sure Steam's own "gyro to mouse" is off, or the camera will
-  move twice as much.
+- **Steam Input:** if it's on for the game, you can set in the config panel if you prefer Steam input mouse input to be used.
 
 ## Installation / uninstall / update
 
 #### Install
 
 1. **Download** `GyroUE-vX.Y.Z.zip` from the [Releases](https://github.com/gfgerard/GyroUE/releases) page.
-2. **Find the game's real exe folder.** It's the one with a file ending in **`-Win64-Shipping.exe`**, usually
+2. **Find the game's real exe folder.**  Usually it's the one with a file ending in **`-Win64-Shipping.exe`**, at 
    `<Game>\<Something>\Binaries\Win64`, **not** the game's main folder (that exe is only a launcher).
-   Tip: search the game folder for `Shipping.exe`. Examples:
+   Tip: search the game folder for `Shipping.exe`. It's where other mods like Optiscaler or Reshade go.
+   
+   Examples:
 
    | Game | Folder |
    |---|---|
@@ -67,7 +68,7 @@ More:
 > [!NOTE]
 > **Nothing happens?** Another mod may already use a `version.dll`, or the game doesn't load it (.log and .ini 
 files should appear inside the **GyroUE** folder).
-> Rename GyroUE's `version.dll` to **`winmm.dll`** (same file, it works under both names) and try again.
+> Rename GyroUE's `version.dll` to **`winmm.dll`** (it works under both names) and try again.
 
 #### Update
 
@@ -97,6 +98,10 @@ changed.
 
 ## Supported games
 
+> [!TIP]
+> **Your game isn't listed?** Most Unreal Engine 4/5 games work without any setup: just try it. If the camera
+doesn't follow the gyro, GyroUE tells you on screen, and [Advanced](ADVANCED.md#finding-the-camera-of-a-new-game) explains how to add support.
+
 | Game | Status | What to know |
 |---|---|---|
 | Pacific Drive | ✅ Works | Gyro on foot **and** in the car. |
@@ -104,10 +109,9 @@ changed.
 | Cronos: The New Dawn | ✅ Works | Settings panel also works with HDR mods (RenoDX). |
 | Life is Strange Remastered | ✅ Works | **No `F10` panel** in this game: change settings in `gyrolib.ini` (see [Using it](#using-it)). |
 | Luto | ✅ Works | |
+| Out of sight | ✅ Works | |
 | Gears of War: E-Day (Game Pass) | ⚠️ Campaign only, **with EasyAntiCheat disabled** | Install in `Binaries\WinGDK`. The gyro starts a few seconds after the main menu appears. Never play online with it. |
 
-**Your game isn't listed?** Most Unreal Engine 4/5 games work without any setup: just try it. If the camera
-doesn't follow the gyro, GyroUE tells you on screen, and [Advanced](ADVANCED.md#finding-the-camera-of-a-new-game) explains how to add support.
 
 
 ## Current scope

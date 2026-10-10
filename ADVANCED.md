@@ -140,6 +140,10 @@ OnGyro=IsAutoControlling:0,Camera_AutoControlAmount_target:0
 
 ## Finding the camera of a new game
 
+> [!IMPORTANT] 
+> GyroUE guides you with on-screen messages but the game can't be using exclusive fullscreen or you won't see them.
+
+
 Most UE games turn the camera from `PlayerController.ControlRotation`, and GyroUE works with no profile.
 Some games keep their own look rotation somewhere else: in a vehicle actor, in a camera component, or in
 C++ memory that Unreal's reflection doesn't describe. The **probe** finds that rotation for you. It records
@@ -150,14 +154,14 @@ The steps below use the real Cronos: The New Dawn session as the example.
 
 ### 1. Check whether the game needs a profile
 
-Install GyroUE, play for a few seconds moving the controller, quit, and open `GyroUE\GyroUE.log`. GyroUE compares
+Install GyroUE, play for a few seconds moving the controller to check if it moves the camera, quit, and open `GyroUE\GyroUE.log`. GyroUE compares
 how much it turned the view with how much the camera actually moved, and says it in one line:
 
 ```text
 camera: confirmed, the camera follows the gyro (ControlRotation, view 'Camera')
 camera: the gyro turned ControlRotation (view 'Camera') by 412 degrees but the camera moved only 0: the game ignores it.
         To find the camera's real rotation, set Probe=1 in ...GyroUE\GyroUE.ini, restart and turn the camera
-        with the right stick (ADVANCED.md: "Finding the camera of a new game").
+        with the right stick.
 ```
 
 The check only runs on the player's own camera (view target = pawn), so scripted or fixed cameras don't trigger it,
@@ -190,8 +194,7 @@ Probe=1
 ```
 
 `GyroUE.ini` holds the settings for every game in that folder. A game's profile
-(`GyroUE\profiles\<game exe>.ini`) can override any of them in its own `[GyroUE]` section, e.g. `Probe=1` for just
-that game.
+(`GyroUE\profiles\<game exe>.ini`) can override any of them in its own `[GyroUE]` section.
 
 `GyroUE.log` now says `profile: probe enabled (automatic capture on stick turns, F7/F8 manual), results in ...GyroUE-probe.log`. The
 probe writes its results to that separate file, `GyroUE\GyroUE-probe.log`, which starts with a short reminder of
