@@ -4,8 +4,8 @@ GyroUE is released under the [MIT License](LICENSE.txt).
 
 ## GyroLib
 
-GyroUE depends on and redistributes **[GyroLib](https://github.com/lud-berthe/GyroLib)** (version 1.3.0,
-commit `b241b7d`), which provides all controller input, gyro processing and the settings panel.
+GyroUE depends on and redistributes **[GyroLib](https://github.com/lud-berthe/GyroLib)** (version 1.3.1,
+commit `9addfd9`), which provides all controller input, gyro processing and the settings panel.
 
 ```text
 MIT License

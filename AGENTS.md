@@ -7,7 +7,7 @@ This file provides guidance to AI code agnets when working with code in this rep
 A universal gyro-aiming mod for PC games: DualSense (and other SDL-supported pads) motion sensors turn
 the in-game camera, with no per-game code in the common case. The plan:
 - gyro math and controller input come from **GyroLib** (https://github.com/lud-berthe/GyroLib, MIT;
-  reviewed at v1.2.2, now pinned to **1.3.0** in `tools/gyrolib-sdk.sh`); we write the engine side;
+  reviewed at v1.2.2, now pinned to **1.3.1** in `tools/gyrolib-sdk.sh`); we write the engine side;
 - the first engine is **Unreal (UE4/UE5)** via a **UE4SS C++ mod**, because every UE game shares the
   reflected `APlayerController` camera path;
 - per-game differences (menus, ADS, vehicles, custom cameras) go in small per-game profiles, not code.

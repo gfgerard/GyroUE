@@ -400,9 +400,9 @@ Requirements:
 
 - Visual Studio 2022 or newer with the C++ desktop workload (MSVC x64, CMake 3.24+). C++20.
 - Git Bash (for the helper scripts).
-- The GyroLib **1.3.0** Windows x64 SDK, from the
+- The GyroLib **1.3.1** Windows x64 SDK, from the
   [GyroLib releases](https://github.com/lud-berthe/GyroLib/releases). Verify it against `SHA256SUMS` and
-  extract it to `third_party/GyroLib-1.3.0/sdk/GyroLib-1.3.0-sdk-windows-x64/`. The pinned version is in
+  extract it to `third_party/GyroLib-1.3.1/sdk/GyroLib-1.3.1-sdk-windows-x64/`. The pinned version is in
   `tools/gyrolib-sdk.sh`.
 
 ```bash

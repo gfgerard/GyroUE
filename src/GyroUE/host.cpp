@@ -19,7 +19,6 @@
 #include <format>
 #include <memory>
 #include <optional>
-#include <deque>
 #include <vector>
 
 namespace gyroue {
@@ -80,119 +79,32 @@ uint32_t g_last_view = UINT32_MAX;
 double g_applied_yaw = 0, g_applied_pitch = 0;
 bool g_applied_this_frame = false;
 
-// Pacing: a jitter buffer for controllers whose motion arrives in bursts. The Switch Pro over Bluetooth measures
-// a sample every ~5 ms, but its reports reach the PC 1-4 at a time with gaps of 3-68 ms (motion trace, Luto). GyroLib
-// then outputs rotation only on the frames where a burst arrived, so the camera moves in steps; its smoothing can't
-// help because it only advances when samples arrive. GyroUE splits each update's rotation over its samples (by
-// gyro speed), queues them, and plays them back at the measured sample rate, keeping just enough queued to cover the
-// usual gaps (like an audio jitter buffer). When samples arrive about every frame (DualSense) nothing is queued or
-// delayed. Pacing=0 in GyroUE.ini disables it; PacingMaxMs caps the delay.
-struct Pacer {
-    bool enabled = true;
-    double max_delay = 0.050;            // PacingMaxMs (s)
-    struct Chunk {
-        double pitch, yaw;
-    };
-    std::deque<Chunk> queue;             // one entry per sample, oldest first
-    double head_used = 0;                // fraction of queue.front() already applied
-    std::vector<double> weights;         // gyro speed of the samples GyroLib processed in this update
-    double rate = 0;                     // measured samples per second
-    uint64_t rate_start_ns = 0;
-    uint32_t rate_count = 0;
-    double gap_mean = 0, gap_var = 0;    // time between updates that brought samples (s)
-    double frame_mean = 0;               // time between updates (s)
-    double target = 0;                   // delay kept in the queue (s)
-    bool active = false;                 // pacing this frame (for the status line)
-    uint64_t last_frame_ns = 0, last_arrival_ns = 0;
+// Motion delivery, for the status line. Samples and distinct arrival times come from GyroLib's sample observer; the
+// camera updates count how often the gyro turned the camera, and how often it did so without a new sample. The Switch
+// Pro over Bluetooth measures a sample every ~5 ms but its reports reach the PC 1-4 at a time with gaps of 3-68 ms;
+// since 1.3.1 GyroLib spreads such bursts over the following updates itself ("burst delivery"), which shows here as
+// rotation on updates without new samples. (GyroUE 0.6.14-0.6.19 had its own pacer for this, Pacing=1.)
+struct Delivery {
+    uint64_t samples = 0, arrivals = 0, last_arrival_ns = 0;
+    uint64_t updates = 0, turned = 0, spread = 0;  // camera updates; with rotation; with rotation but no new sample
+    uint64_t since_ns = 0;
 
     void on_sample(const gl_sample& sample) {
-        const gl_vec3 g = sample.gyro_dps;
-        weights.push_back(std::sqrt(double(g.x) * g.x + double(g.y) * g.y + double(g.z) * g.z) + 1e-3);
+        ++samples;
+        if (sample.arrival_ns != last_arrival_ns) ++arrivals, last_arrival_ns = sample.arrival_ns;
     }
-    void reset() {
-        queue.clear();
-        head_used = 0;
+    void on_update(bool camera, uint32_t new_samples, bool rotation) {
+        if (!camera) return;
+        ++updates;
+        if (rotation) ++turned, spread += new_samples == 0;
     }
-    double depth() const { return double(queue.size()) - head_used; }  // queued samples
-
-    // Take up to `count` samples from the head of the queue into out.
-    void take(double count, double& out_pitch, double& out_yaw) {
-        while (count > 1e-9 && !queue.empty()) {
-            const double t = std::min(count, 1.0 - head_used);
-            out_pitch += queue.front().pitch * t;
-            out_yaw += queue.front().yaw * t;
-            head_used += t;
-            count -= t;
-            if (head_used >= 1.0 - 1e-9) {
-                queue.pop_front();
-                head_used = 0;
-            }
-        }
-    }
-
-    // in: this update's GyroLib output. out: what to apply now.
-    void step(uint64_t now_ns, double in_pitch, double in_yaw, double& out_pitch, double& out_yaw) {
-        const double dt = last_frame_ns ? double(now_ns - last_frame_ns) * 1e-9 : 0;
-        last_frame_ns = now_ns;
-        if (dt > 0 && dt < 0.2) frame_mean = frame_mean ? frame_mean + (dt - frame_mean) * 0.05 : dt;
-        const size_t n = weights.size();
-        if (n) {
-            if (last_arrival_ns) {
-                const double gap = double(now_ns - last_arrival_ns) * 1e-9;
-                if (gap < 0.2) {  // ignore pauses (no samples while the pad sleeps or the game hitches)
-                    if (!gap_mean) gap_mean = gap;
-                    const double d = gap - gap_mean;
-                    gap_mean += d * 0.05;
-                    gap_var += (d * d - gap_var) * 0.05;
-                }
-            }
-            last_arrival_ns = now_ns;
-            if (!rate_start_ns) rate_start_ns = now_ns;
-            rate_count += uint32_t(n);
-            const double span = double(now_ns - rate_start_ns) * 1e-9;
-            if (span >= 1.0) {
-                const double r = rate_count / span;
-                rate = rate ? rate + (r - rate) * 0.3 : r;
-                rate_start_ns = now_ns;
-                rate_count = 0;
-            }
-        }
-        // Delay that covers nearly all gaps between bursts, capped by PacingMaxMs.
-        target = std::min(gap_mean + 0.5 * std::sqrt(gap_var), max_delay);
-        // Pace only when bursts are clearly further apart than updates; else samples already come every frame.
-        active = enabled && rate > 0 && dt > 0 && frame_mean > 0 && gap_mean > frame_mean * 1.5;
-        out_pitch = out_yaw = 0;
-        if (!active) {
-            take(depth() + 1, out_pitch, out_yaw);  // flush anything still queued
-            reset();
-            out_pitch += in_pitch, out_yaw += in_yaw;
-            weights.clear();
-            return;
-        }
-        if (n) {
-            double sum = 0;
-            for (double w : weights) sum += w;
-            for (double w : weights) queue.push_back({in_pitch * w / sum, in_yaw * w / sum});
-        } else {
-            out_pitch += in_pitch, out_yaw += in_yaw;  // output with no new samples (GyroLib smoothing tail): as is
-        }
-        weights.clear();
-        // Play back at the sample rate, slightly faster or slower to keep about `target` seconds queued.
-        const double want = target * rate;
-        const double speed = std::clamp(1.0 + 0.5 * (depth() - want) / std::max(want, 1.0), 0.5, 2.0);
-        take(rate * dt * speed, out_pitch, out_yaw);
-        // After a stall, never keep more than 1.5x the maximum delay queued.
-        const double limit = max_delay * rate * 1.5;
-        if (depth() > limit) take(depth() - limit, out_pitch, out_yaw);
-    }
-};
-Pacer g_pacer;
-uint32_t g_paced_view = 0;
+} g_delivery;
 
 // Motion trace (MotionTrace=1 in GyroUE.ini): 30 s of per-sample and per-frame timing in GyroUE\motion-trace.csv,
-// to see where motion gets bunched (controller, transport, frame) and how pacing spreads it.
+// to see where motion gets bunched (controller, transport, frame) and how GyroLib's burst delivery spreads it.
 //   S,sensor_ns,arrival_ns,gyro_x,gyro_y,gyro_z         every accepted sample (GyroLib sample observer)
-//   F,now_ns,new_samples,raw_yaw,raw_pitch,yaw,pitch     every frame while the gyro may turn the camera
+//   F,now_ns,new_samples,raw_yaw,raw_pitch,yaw,pitch     every frame while the gyro may turn the camera (raw = GyroLib
+//                                                        output, yaw/pitch = applied; equal since GyroUE has no pacer)
 struct Trace {
     bool wanted = false, done = false;
     FILE* file = nullptr;
@@ -201,7 +113,7 @@ struct Trace {
 
 void GL_CALL on_sample(void*, uint64_t, const gl_sample* sample) {
     if (!sample) return;
-    g_pacer.on_sample(*sample);
+    g_delivery.on_sample(*sample);
     if (g_trace.file)
         std::fprintf(g_trace.file, "S,%llu,%llu,%.3f,%.3f,%.3f\n", (unsigned long long)sample->sensor_ns,
                      (unsigned long long)sample->arrival_ns, sample->gyro_dps.x, sample->gyro_dps.y, sample->gyro_dps.z);
@@ -315,13 +227,7 @@ const char kDefaultSettings[] =
     ";     Set it back to 0 once the camera works. Results: GyroUE\\GyroUE-probe.log.\r\n"
     "Probe=0\r\n"
     "; 0 = no on-screen notices (they still go to GyroUE.log).\r\n"
-    "Notices=1\r\n"
-    "; 1 = spread motion that a controller sends in bursts (e.g. Switch Pro, ~66 bursts/s) evenly over the frames, so\r\n"
-    ";     the camera turns smoothly at high frame rates. Adds at most one burst interval of delay, and none for\r\n"
-    ";     controllers that report every frame (DualSense). 0 = apply each burst as it arrives.\r\n"
-    "Pacing=1\r\n"
-    "; Bursts further apart than this (ms) are not paced.\r\n"
-    "PacingMaxMs=50\r\n";
+    "Notices=1\r\n";
 
 void ensure_settings_file() {
     if (GetFileAttributesW(g_settings_path.c_str()) != INVALID_FILE_ATTRIBUTES) return;
@@ -353,11 +259,8 @@ void load_profile() {
     ensure_settings_file();
     g_profile_existed = GetFileAttributesW(g_profile_path.c_str()) != INVALID_FILE_ATTRIBUTES;
     g_probe = setting(L"Probe", 0) != 0;
-    g_pacer.enabled = setting(L"Pacing", 1) != 0;
     g_trace.wanted = setting(L"MotionTrace", 0) != 0;
     if (g_trace.wanted) log("settings: MotionTrace=1 (30 s from the first gameplay frame)");
-    g_pacer.max_delay = std::clamp(setting(L"PacingMaxMs", 50), 5, 100) / 1000.0;
-    log("settings: Pacing=%d PacingMaxMs=%d", g_pacer.enabled ? 1 : 0, int(g_pacer.max_delay * 1000 + 0.5));
     // On-screen notices (camera check, probe progress); Notices=0 keeps them in the log only.
     const bool notices = setting(L"Notices", 1) != 0;
     log("settings: Probe=%d Notices=%d (GyroUE.ini, the game's profile overrides)", g_probe ? 1 : 0, notices ? 1 : 0);
@@ -439,7 +342,7 @@ bool start_gyro() {
         gl_get_gamepad_menu_shortcut(ctx));
 
     g_input.emplace(*g_gyro);
-    gl_set_sample_observer(ctx, &on_sample, nullptr);  // pacing (and the motion trace) need every sample
+    gl_set_sample_observer(ctx, &on_sample, nullptr);  // delivery status (and the motion trace) need every sample
     log("gyro: SDL reader started");
     return true;
 }
@@ -868,11 +771,18 @@ void status(const Scene& s, const View* view) {
         log("status: addresses pc=0x%llX (ControlRotation +0x%X) pawn=0x%llX camera=0x%llX", (unsigned long long)s.pc,
             cr ? unsigned(cr.offset) : 0u, (unsigned long long)s.pawn, (unsigned long long)s.camera);
     }
-    log("status: motion %.0f samples/s, bursts every %.1f ms, updates every %.1f ms -> pacing %s", g_pacer.rate,
-        g_pacer.gap_mean * 1000, g_pacer.frame_mean * 1000,
-        !g_pacer.enabled ? "off (Pacing=0)"
-        : g_pacer.active ? std::format("on, {:.0f} ms buffer", g_pacer.target * 1000).c_str()
-                         : "not needed");
+    {
+        Delivery& m = g_delivery;
+        const uint64_t now_ns = SDL_GetTicksNS();
+        const double span = m.since_ns ? double(now_ns - m.since_ns) * 1e-9 : 0;
+        if (span > 0)
+            log("status: motion %.0f samples/s in %.0f arrivals/s | camera updates %.0f/s, %.0f%% turned, %.0f%% of "
+                "those without a new sample (GyroLib burst delivery)",
+                m.samples / span, m.arrivals / span, m.updates / span, m.updates ? 100.0 * m.turned / m.updates : 0.0,
+                m.turned ? 100.0 * m.spread / m.turned : 0.0);
+        m.samples = m.arrivals = m.updates = m.turned = m.spread = 0;
+        m.since_ns = now_ns;
+    }
     if (view && !view->offsets.empty()) {
         const ue::Obj o = view_object(*view, s);
         std::string text;
@@ -931,15 +841,14 @@ void frame() {
     const gl_output out = g_input->update(now_ns, host, view_id);
 
     double gyro_deg = 0;  // gyro rotation actually written this frame
-    double pitch = 0, yaw = 0;
-    g_pacer.step(now_ns, out.pitch_degrees, out.yaw_degrees, pitch, yaw);
-    if (g_trace.wanted) {
+    const double pitch = out.pitch_degrees, yaw = out.yaw_degrees;
+    {
         gl_gyro_state gs{};
         gl_get_gyro_state(g_gyro->get(), &gs);
-        trace_frame(now_ns, view && host.camera_allowed && gs.enabled, gs.new_samples, out, pitch, yaw);
+        const bool camera = view && host.camera_allowed && gs.enabled;
+        g_delivery.on_update(camera, gs.new_samples, yaw != 0 || pitch != 0);
+        trace_frame(now_ns, camera, gs.new_samples, out, pitch, yaw);
     }
-    if (!view || !host.camera_allowed || probe_capturing() || view_id != g_paced_view) g_pacer.reset();  // never carry over
-    g_paced_view = view_id;
     if (view && host.camera_allowed && !probe_capturing() && (yaw != 0 || pitch != 0)) {
         if (apply(*view, s, pitch, yaw)) {
             g_applied_this_frame = true;

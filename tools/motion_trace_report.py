@@ -71,7 +71,7 @@ def main(path):
     describe("frame interval", frame_gaps)
     print(f"  new samples per frame: {dict(sorted(Counter(fr[1] for fr in frames).items()))}")
 
-    for label, idx in (("raw GyroLib yaw", 2), ("applied yaw (after pacing)", 3)):
+    for label, idx in (("GyroLib output yaw", 2), ("applied yaw", 3)):
         result = smoothness(frames, idx)
         if result is None:
             print(f"  {label}: not enough frames")

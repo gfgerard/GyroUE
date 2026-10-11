@@ -862,6 +862,35 @@ UE4SS C++ mod built on GyroLib and no per-game code in the common case. Design b
 - Heap scan as the universal GUObjectArray finder: works for any build, but the data-section scan stays first (instant
   in normal games); the heap scan remains the fallback.
 
+- 2026-10-11 **GyroLib 1.3.1: upstream burst delivery replaces GyroUE's pacer.** GyroLib
+  commit 9addfd9 answers our report (GyroLib issue #1). SHA256SUMS verified for the SDK, the demo and `gyrolib.dll`
+  6841434…; ABI 1, INI schema 0.2.0 and headers unchanged apart from a comment. Also fixes GyroLib issue #2
+  (INI `gyro.acceleration=0` with stale fast sensitivities stays Off).
+  - **How GyroLib does it** (`src/detail/delivery.hpp`, `MotionDelivery`, per endpoint, inside `gl_update` after the
+    camera/cursor angles and before trackball/flick): a sample batch counts as a burst when consecutive samples are
+    >= 2 ms apart in sensor time but arrive < 1 ms apart; three consecutive bursts separated by updates with no
+    samples latch pacing until the source restarts. Each update's integrated angle is then spread linearly over a
+    window (peak-hold of the gap between batches, x0.98 per batch, 15-60 ms), starting at the next update; time-based,
+    so a second update at the same timestamp outputs nothing. Pending angle is dropped on gates, calibration,
+    view/target/profile/modifier changes and stalls > 100 ms. SDL source only (not Steam), no INI setting, flick stick
+    and trackball not buffered. Synthetic tests only; no real Switch Pro test upstream.
+  - **Compared with GyroUE 0.6.17** (queue per sample weighted by gyro speed, played at the measured sample rate,
+    holding `gap_mean + 0.5σ` capped by PacingMaxMs, statistical on/off every frame, switchable). Synthetic replay of a
+    Switch Pro BT stream modelled on the Luto trace (5.24 ms sensor, bunched arrivals, 60/85x2/144 fps): both cut empty
+    frames from 42-75% to 0.3-2.6% and speed CV from 1.0-1.9 to 0.31-0.36 (GyroUE) / 0.38-0.44 (GyroLib; ideal
+    0.24-0.44), and both add about 25 ms over the raw output. GyroLib's window sat at a median 39-42 ms.
+    Risks to check on hardware: the latch never releases (a DualSense over BT whose reports bunch could get a
+    permanent >= 15 ms window), and Steam-provider motion isn't paced.
+  - **GyroUE change (no version bump yet):** the Pacer, `Pacing` and `PacingMaxMs` are removed (both pacers stacked
+    would delay twice and re-bunch); old keys in existing `GyroUE.ini` files are ignored. `MotionTrace` stays (raw
+    and applied columns are now equal). New status line from the sample observer and `gl_gyro_state.new_samples`:
+    `motion N samples/s in M arrivals/s | camera updates U/s, T% turned, P% of those without a new sample (GyroLib
+    burst delivery)`. P > 0 while turning means GyroLib is pacing; it must stay ~0 for a DualSense.
+  - **Luto test (user), Switch Pro over Bluetooth, Steam Input off:** works well with GyroLib 1.3.1 and no GyroUE
+    pacer (tested with a test build of this change; an existing `Pacing=1` line in GyroUE.ini is ignored).
+  - **Still to test:** Switch Pro over USB, DualSense over USB and BT (the status-line P% must stay ~0, see the latch
+    risk above), Steam Input on, and a `MotionTrace=1` capture for `tools/motion_trace_report.py`.
+
 ## Dead ends
 
 (none yet)
