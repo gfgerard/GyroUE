@@ -2,7 +2,8 @@
 # Builds GyroUE and packs the installable release zip: build/release/GyroUE-v<version>.zip
 # (version from project() in src/GyroUE/CMakeLists.txt). Extract the zip into the game's
 # <Project>/Binaries/Win64 folder: it holds winmm.dll and the GyroUE folder, the same files
-# tools/deploy-gyroue.sh installs, plus every profile and the user docs (README, TROUBLESHOOTING, ADVANCED, CREDITS). No gyrolib.ini: users keep theirs.
+# tools/deploy-gyroue.sh installs, plus every profile and the user docs (README, TROUBLESHOOTING, ADVANCED, CREDITS,
+# in GyroUE/readme). No gyrolib.ini: users keep theirs.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$ROOT/tools/gyrolib-sdk.sh"; SDK="$GYROLIB_SDK"
@@ -18,7 +19,7 @@ NAME="GyroUE-v$VERSION"
 OUT="$ROOT/build/release"
 STAGE="$OUT/$NAME"
 rm -rf "$STAGE" "$OUT/$NAME.zip"
-mkdir -p "$STAGE/GyroUE/profiles" "$STAGE/GyroUE/licenses"
+mkdir -p "$STAGE/GyroUE/profiles" "$STAGE/GyroUE/licenses" "$STAGE/GyroUE/readme"
 cp "$DLL" "$STAGE/winmm.dll"
 cp "$SDK/bin/gyrolib.dll" "$STAGE/GyroUE/gyrolib.dll"
 cp "$ROOT/profiles/"*.ini "$STAGE/GyroUE/profiles/"
@@ -27,7 +28,8 @@ cp "$SDK/share/doc/GyroLib/licenses/"* "$STAGE/GyroUE/licenses/"
 cp "$SDK/share/doc/GyroLib/sdl-changes/README-GyroLib.md" "$STAGE/GyroUE/licenses/SDL-CHANGES.md"
 cp "$ROOT/LICENSE.txt" "$STAGE/GyroUE/licenses/GyroUE-LICENSE.txt"
 cp "$ROOT/third_party/minhook-1.3.4/LICENSE.txt" "$STAGE/GyroUE/licenses/MinHook-LICENSE.txt"  # linked into winmm.dll
-for doc in README TROUBLESHOOTING ADVANCED CREDITS; do cp "$ROOT/$doc.md" "$STAGE/GyroUE/$doc.md"; done
+# Together in one folder, so the links between them keep working.
+for doc in README TROUBLESHOOTING ADVANCED CREDITS; do cp "$ROOT/$doc.md" "$STAGE/GyroUE/readme/$doc.md"; done
 
 # Python's zipfile writes forward-slash paths (PowerShell 5.1's Compress-Archive writes backslashes).
 python -I - "$(cygpath -w "$STAGE")" "$(cygpath -w "$OUT/$NAME.zip")" <<'EOF'

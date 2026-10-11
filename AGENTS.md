@@ -99,7 +99,7 @@ Every time you build a new version of GyroUE, also produce its release zip:
 2. Run `bash tools/package-gyroue.sh`. It builds, checks that `winmm.dll` carries that exact version,
    and writes `build/release/GyroUE-v<version>.zip`. Extract the zip into a game's
    `<Project>\Binaries\Win64` folder: `winmm.dll` plus `GyroUE\` (`gyrolib.dll`, all `profiles/`,
-   `licenses/`, `README.md`, `TROUBLESHOOTING.md`, `ADVANCED.md`, `CREDITS.md`). It ships no `gyrolib.ini` or `GyroUE.ini` (both created on first run), so users keep
+   `licenses/`, and `readme/` with `README.md`, `TROUBLESHOOTING.md`, `ADVANCED.md`, `CREDITS.md`). It ships no `gyrolib.ini` or `GyroUE.ini` (both created on first run), so users keep
    their settings when they update.
 3. Record the new version and what changed in `MODLOG.md`.
 

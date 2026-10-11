@@ -73,7 +73,8 @@ More:
 #### Update
 
 Extract the new zip over the old files and overwrite. Your settings (`gyrolib.ini`, `GyroUE.ini`)
-are kept.
+are kept. Since 0.7.0 the documents are in `GyroUE\readme\`: the old `.md` files directly in `GyroUE\` can be
+deleted.
 
 #### Uninstall
 
