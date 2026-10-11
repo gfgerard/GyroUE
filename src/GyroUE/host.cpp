@@ -817,11 +817,11 @@ void follow_check(const Scene& s, const View* view, double gyro_deg) {
             notify::show(L"GyroUE: the gyro doesn't move this camera yet.\nThe probe is on: turn the camera with the "
                          L"right stick to find the right rotation.", 12);
         else if (view->offsets.empty() && view->property.empty())
-            notify::show(L"GyroUE: this game's camera ignores the gyro.\nTo find it, set Probe=1 in GyroUE\\GyroUE.ini, "
-                         L"restart the game and turn the camera with the right stick.", 20);
+            notify::show(L"GyroUE: this game's camera seems to ignore the gyro.\nTo find it, set Probe=1 in GyroUE\\GyroUE.ini, "
+                         L"restart the game. Ignore this if it's actually working.", 15);
         else
             notify::show(L"GyroUE: the camera doesn't follow the profile's rotation.\nThe profile may be outdated: "
-                         L"set Probe=1 in GyroUE\\GyroUE.ini to find the camera again.", 20);
+                         L"set Probe=1 in GyroUE\\GyroUE.ini to find the camera again.", 15);
         g_need_pov = false;
     }
     if (!g_follow.confirmed && g_follow.followed >= 3) {
