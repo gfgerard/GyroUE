@@ -119,6 +119,8 @@ Label=Camera
 ;   Property=Name        a reflected FRotator property on that object
 ;   Offsets=0x2A0,0x420  raw FRotator offsets instead (non-reflected C++ state); all get the delta
 ;   RotatorSize=24       24 = double (UE5), 12 = float (UE4)
+;   WorldRotation=1      with Property=RelativeRotation of a scene component that uses absolute rotation: also
+;                        writes the component's world rotation (see "Components with absolute rotation")
 
 [View.InCar]
 Id=2
@@ -302,6 +304,7 @@ Turn the chosen line into profile keys:
 | `rot ... .PropertyName` | `Property=PropertyName` |
 | `raw ...+0x2A0` | `Offsets=0x2A0` (the offset of the **pitch** value, i.e. the start of the rotator) |
 | `double` / `float` | `RotatorSize=24` (UE5) / `RotatorSize=12` (UE4) |
+| `WorldRotation=1` in the suggestion | keep it (a component with absolute rotation, Example 3) |
 
 **Example 1: non-reflected rotator in a pawn component (Cronos, UE5).** The camera is always the
 character's, so the default view is redirected:
@@ -337,6 +340,27 @@ Parent=1
 ; From the num lines: the car re-centres its camera unless these are cleared while the player looks.
 OnGyro=IsAutoControlling:0,Camera_AutoControlAmount_target:0,Camera_AutoControlAmount_current:0
 ```
+
+**Example 3: a camera component with absolute rotation (Severed Steel, UE4).** The character turns its
+`FirstPersonCamera` component directly from the component's current world rotation (look input, then
+`SetWorldRotation`), and copies the result to `ControlRotation` every frame, so `ControlRotation` is only an output.
+A component with absolute rotation keeps its rotation twice: in `RelativeRotation` (reflected) and in its world
+transform `ComponentToWorld` (not reflected), which is what the game reads back. Writing `RelativeRotation` alone
+is undone the same frame. `WorldRotation=1` writes both:
+
+```ini
+[View.Default]
+Label=Camera
+Object=Pawn.FPCamera
+Property=RelativeRotation
+WorldRotation=1
+```
+
+GyroUE finds `ComponentToWorld` by value the first time (its quaternion equals the `RelativeRotation` one; log:
+`ue: CameraComponent ComponentToWorld rotation at +0x1C0`) and only writes while the two still agree. If they
+don't (the component isn't absolute, or the game is between its writes), it skips that frame and logs
+`profile: view N WorldRotation not applied to ...` with the reason. The probe suggests this form by itself for
+attached components whose world rotation matches their `RelativeRotation`, a camera component first.
 
 Use the **default view** with `Object=` when the game always uses that camera. Use an **extra view** with
 `ViewTargetClass=` when a different camera takes over in some situations (vehicles, turrets). Extra views use

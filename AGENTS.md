@@ -31,6 +31,7 @@ Read these first:
   which pad, connection (USB/BT) and Steam Input state it was tested with.
 - Do not write local system paths, device hardware addresses, users or any sensitive information 
   into code comments nor *.md files
+- Do not increase release version automatically. Ask for version to use if needed.
 
 ## Architecture (target)
 

@@ -862,6 +862,8 @@ struct Candidate {
     int size = 0;          // 12 = float rotator, 24 = double rotator
     int hits = 0;          // scored diffs in which it held the camera's pitch and yaw
     std::string why_not;   // "" = usable in a profile, else why it is ignored
+    bool world = false;    // a component's RelativeRotation with absolute rotation: the profile needs WorldRotation=1
+    bool camera = false;   // ... of a CameraComponent (the engine takes the view from it)
 };
 std::map<std::string, Candidate> g_candidates;
 int g_scored_diffs = 0;
@@ -947,7 +949,127 @@ void collect_struct(uintptr_t base, Obj st, const std::string& prefix, int depth
     }
 }
 
+// FRotator::Quaternion() (UE4 and UE5): x, y, z, w.
+void rotator_quat(double pitch, double yaw, double roll, double q[4]) {
+    const double k = 3.14159265358979323846 / 360.0;  // degrees to half-angle radians
+    const double sp = std::sin(pitch * k), cp = std::cos(pitch * k);
+    const double sy = std::sin(yaw * k), cy = std::cos(yaw * k);
+    const double sr = std::sin(roll * k), cr = std::cos(roll * k);
+    q[0] = cr * sp * sy - sr * cp * cy;
+    q[1] = -cr * sp * cy - sr * cp * sy;
+    q[2] = cr * cp * sy - sr * sp * cy;
+    q[3] = cr * cp * cy + sr * sp * sy;
+}
+
+// A quaternion of floats (UE4) or doubles (UE5).
+bool read_quat(uintptr_t address, bool wide, double q[4]) {
+    if (wide) return guarded_copy(q, address, 4 * sizeof(double));
+    float f[4];
+    if (!guarded_copy(f, address, sizeof(f))) return false;
+    for (int i = 0; i < 4; ++i) q[i] = f[i];
+    return true;
+}
+
+bool write_quat(uintptr_t address, bool wide, const double q[4]) {
+    if (wide) return guarded_store(address, q, 4 * sizeof(double));
+    const float f[4] = {float(q[0]), float(q[1]), float(q[2]), float(q[3])};
+    return guarded_store(address, f, sizeof(f));
+}
+
+bool same_rotation(const double a[4], const double b[4]) {  // q and -q are the same rotation
+    double same = 0, opposite = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (!std::isfinite(a[i])) return false;
+        same = (std::max)(same, std::abs(a[i] - b[i]));
+        opposite = (std::max)(opposite, std::abs(a[i] + b[i]));
+    }
+    return (std::min)(same, opposite) < 2e-3;
+}
+
+// Offset of ComponentToWorld's rotation in a component class (found once per class, from a live component).
+std::vector<std::pair<Obj, int32_t>> g_world_rotation_offsets;
+
+// ComponentToWorld isn't reflected, so it's found by value: with absolute rotation its quaternion is
+// RelativeRotation's. The rotation caches (FRotationConversionCache: the quaternion, then the rotator it came from)
+// hold the same quaternion, so the transform is the match NOT followed by that rotator (it's followed by the world
+// translation). Scanned at 16-byte alignment (FTransform is SIMD-aligned) within the SceneComponent part.
+int32_t world_rotation_offset(Obj component, const Prop& relative) {
+    const Obj cls = class_of(component);
+    for (const auto& [c, offset] : g_world_rotation_offsets)
+        if (c == cls) return offset;
+    double p = 0, y = 0, r = 0;
+    if (!read_rotator(component + relative.offset, relative.element_size, p, y, r)) return -1;
+    double want[4];
+    rotator_quat(p, y, r, want);
+    const bool wide = relative.element_size == 24;
+    const int32_t quat_size = wide ? 32 : 16, end = engine_part_size(component, "SceneComponent");
+    for (int32_t off = 0x30; off + quat_size + relative.element_size <= end; off += 16) {
+        double q[4];
+        if (off == relative.offset || !read_quat(component + off, wide, q) || !same_rotation(q, want)) continue;
+        double cp = 0, cy = 0, cr = 0;
+        if (read_rotator(component + off + quat_size, relative.element_size, cp, cy, cr) && near_angle(cp, p) &&
+            near_angle(cy, y) && near_angle(cr, r))
+            continue;  // a rotation cache
+        g_world_rotation_offsets.emplace_back(cls, off);
+        log("ue: %s ComponentToWorld rotation at +0x%X (absolute rotation, %s)", name_of(cls).c_str(), off,
+            wide ? "double" : "float");
+        return off;
+    }
+    return -1;
+}
+
 }  // namespace
+
+bool has_world_rotation(Obj component, const Prop& relative) {
+    if (!g_ready || !component || !relative || (relative.element_size != 12 && relative.element_size != 24)) return false;
+    const int32_t off = world_rotation_offset(component, relative);
+    double p = 0, y = 0, r = 0, want[4], q[4];
+    if (off < 0 || !read_rotator(component + relative.offset, relative.element_size, p, y, r)) return false;
+    rotator_quat(p, y, r, want);
+    return read_quat(component + off, relative.element_size == 24, q) && same_rotation(q, want);
+}
+
+bool add_world_rotation(Obj component, const Prop& relative, double pitch, double yaw, const char*& why) {
+    why = nullptr;
+    if (!g_ready || !component || !relative || (relative.element_size != 12 && relative.element_size != 24)) {
+        why = "not a rotator property";
+        return false;
+    }
+    const bool wide = relative.element_size == 24;
+    const int32_t off = world_rotation_offset(component, relative);
+    if (off < 0) {
+        why = "its world rotation doesn't match RelativeRotation (no absolute rotation?)";
+        return false;
+    }
+    double p = 0, y = 0, r = 0, q[4], want[4];
+    if (!read_rotator(component + relative.offset, relative.element_size, p, y, r) || !read_quat(component + off, wide, q)) {
+        why = "unreadable";
+        return false;
+    }
+    rotator_quat(p, y, r, want);
+    if (!same_rotation(q, want)) {  // the game is between its two writes, or the rotation stopped being absolute
+        why = "its world rotation doesn't match RelativeRotation this frame";
+        return false;
+    }
+    // Pitch stays short of straight up/down: past 90 the rotator flips (yaw + 180) when the game converts it back.
+    double np = p + pitch;
+    if (std::abs(np) > 89.0 && std::abs(np) > std::abs(p)) np = std::abs(p) > 89.0 ? p : std::copysign(89.0, np);
+    const double ny = y + yaw;
+    rotator_quat(np, ny, r, q);
+    bool ok;
+    if (wide) {
+        const double v[3] = {np, ny, r};
+        ok = guarded_store(component + relative.offset, v, sizeof(v));
+    } else {
+        const float v[3] = {float(np), float(ny), float(r)};
+        ok = guarded_store(component + relative.offset, v, sizeof(v));
+    }
+    if (!ok || !write_quat(component + off, wide, q)) {
+        why = "write failed";
+        return false;
+    }
+    return true;
+}
 
 bool camera_pov(Obj camera, double& pitch, double& yaw) {
     if (!g_ready || !camera) return false;
@@ -1134,7 +1256,13 @@ int probe_diff(bool verbose) {
         split_label(l.label, c.object, c.cls, c.property);
         c.size = l.kind == 2 ? 12 : 24;
         if (c.object.rfind("Camera", 0) == 0) c.why_not = "camera output";
-        else if (c.property.find("RelativeRotation") != std::string::npos) c.why_not = "component transform (output)";
+        else if (c.property == "RelativeRotation" && read_obj(l.obj, "AttachParent") &&
+                 has_world_rotation(l.obj, prop_of(l.obj, "RelativeRotation"))) {
+            // An attached component with absolute rotation: the game sets its world rotation itself, so it may be the
+            // state it turns (Severed Steel's FirstPersonCamera). Root components are the actor's rotation (output).
+            c.world = true;
+            c.camera = is_a(l.obj, "CameraComponent");
+        } else if (c.property.find("RelativeRotation") != std::string::npos) c.why_not = "component transform (output)";
         else if (c.object == "PC" && c.property == "ControlRotation") c.why_not = "the default view (already tried)";
         else if (c.property.find('.') != std::string::npos) c.why_not = "nested in a struct (not usable as Property=)";
         score(c.object + "|" + c.property, c, seen);
@@ -1204,6 +1332,7 @@ std::string probe_suggestion(const std::string& exe_stem, std::string& summary, 
         std::string object, cls, property;
         std::vector<int32_t> offsets;
         int size = 0, hits = 0, rank = 0;
+        bool world = false;
     };
     std::vector<Group> groups;
     for (const Candidate* c : usable) {
@@ -1211,10 +1340,11 @@ std::string probe_suggestion(const std::string& exe_stem, std::string& summary, 
             return g.object == c->object && g.property.empty() == c->property.empty() && (!c->property.empty() || g.size == c->size);
         });
         if (it == groups.end() || !c->property.empty()) {
-            Group g{c->object, c->cls, c->property, {}, c->size, 0, 0};
+            Group g{c->object, c->cls, c->property, {}, c->size, 0, 0, c->world};
             // Inputs usually live in the pawn or its components; then the view target, then the controller and the
-            // camera manager's own fields.
-            g.rank = c->object.rfind("Pawn", 0) == 0 ? 3 : c->object.rfind("ViewTarget", 0) == 0 ? 2 : 1;
+            // camera manager's own fields. A camera component with absolute rotation comes first: the engine takes
+            // the view from it, and only the game sets its rotation.
+            g.rank = c->camera ? 4 : c->object.rfind("Pawn", 0) == 0 ? 3 : c->object.rfind("ViewTarget", 0) == 0 ? 2 : 1;
             groups.push_back(g);
             it = groups.end() - 1;
         }
@@ -1228,7 +1358,8 @@ std::string probe_suggestion(const std::string& exe_stem, std::string& summary, 
     });
     auto view_lines = [](const Group& g, const char* indent) {
         std::string s = std::string(indent) + "Object=" + g.object + "\n";
-        if (!g.property.empty()) return s + indent + "Property=" + g.property + "\n";
+        if (!g.property.empty())
+            return s + indent + "Property=" + g.property + "\n" + (g.world ? std::string(indent) + "WorldRotation=1\n" : "");
         std::string offsets;
         for (int32_t off : g.offsets) offsets += (offsets.empty() ? "" : ",") + std::format("0x{:X}", off);
         return s + indent + "Offsets=" + offsets + "\n" + indent + "RotatorSize=" + std::to_string(g.size) + "\n";
@@ -1257,7 +1388,8 @@ std::string probe_suggestion(const std::string& exe_stem, std::string& summary, 
     } else {
         const Group& best = groups.front();
         text += "[View.Default]\nLabel=Camera\n" + view_lines(best, "");
-        summary = best.object + (best.property.empty() ? std::format(" raw x{}", best.offsets.size()) : "." + best.property);
+        summary = best.object + (best.property.empty() ? std::format(" raw x{}", best.offsets.size()) : "." + best.property) +
+                  (best.world ? " (WorldRotation)" : "");
         if (groups.size() > 1) {
             text += "\n; Alternatives (also followed the camera):\n";
             for (size_t i = 1; i < groups.size() && i < 8; ++i) text += view_lines(groups[i], ";   ") + ";\n";

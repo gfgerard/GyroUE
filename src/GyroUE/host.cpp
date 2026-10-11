@@ -37,6 +37,10 @@ struct View {
     std::vector<std::string> object;  // path to the view object (empty = PC for the default view, else ViewTarget)
     std::vector<int32_t> offsets;     // raw rotator offsets in the view object (instead of Property)
     int32_t rotator_size = 24;        // 24 = double (UE5), 12 = float (UE4)
+    // WorldRotation=1: Property is a scene component's RelativeRotation with absolute rotation; its world rotation
+    // (ComponentToWorld) is written too, because the game turns the component from it (Severed Steel's camera).
+    bool world_rotation = false;
+    const char* world_why = nullptr;  // last reason it couldn't be applied (logged when it changes)
     uint32_t parent = 0;            // settings inheritance
     // Optional: scalar properties written whenever the gyro moves this view (e.g. to cancel a camera
     // auto-recentering that the game only cancels for stick input). "Name:value" is on the view object;
@@ -257,6 +261,7 @@ void load_view_extras(View& v, const wchar_t* section) {
     for (const std::string& o : split(ini(section, L"Offsets"), ','))
         v.offsets.push_back(int32_t(std::strtol(o.c_str(), nullptr, 0)));
     v.rotator_size = GetPrivateProfileIntW(section, L"RotatorSize", 24, g_profile_path.c_str());
+    v.world_rotation = GetPrivateProfileIntW(section, L"WorldRotation", 0, g_profile_path.c_str()) != 0;
     v.watch = split(ini(section, L"Watch"), ',');
     v.watched_values.assign(v.watch.size(), std::string{});
     v.dump = GetPrivateProfileIntW(section, L"Dump", 0, g_profile_path.c_str()) != 0;
@@ -291,7 +296,8 @@ std::string probe_header() {
            "How to read it (ADVANCED.md, \"Finding the camera of a new game\"):\n"
            "  rot <path>.<Property>         a reflected rotator that changed  -> profile: Object=<path>, Property=<Property>\n"
            "  raw <path>+0xNN double/float  non-reflected memory that follows the camera -> Object=<path>, Offsets=0xNN\n"
-           "  Ignore Camera(...) and transform components: they are the camera's output, not its input.\n"
+           "  Ignore Camera(...) and transform components: they are the camera's output, not its input (except a\n"
+           "  component's RelativeRotation that the suggested profile marks WorldRotation=1).\n"
            "  The path is the part before \"(\"; the class in parentheses is only informative.\n"
            "\n";
 }
@@ -399,6 +405,7 @@ void load_profile() {
         for (const std::string& part : v.object) object += (object.empty() ? "" : ".") + part;
         for (int32_t off : v.offsets) where += (where.empty() ? "raw +0x" : ",0x") + std::format("{:X}", off);
         if (where.empty()) where = v.property.empty() ? "ControlRotation" : v.property;
+        if (v.world_rotation) where += v.offsets.empty() ? " (WorldRotation)" : " (WorldRotation ignored: needs Property=)";
         log("  view %u '%s' target=%s object=%s rotation=%s parent=%u", v.id, v.label.c_str(),
             v.view_target_class.empty() ? "(pawn)" : v.view_target_class.c_str(),
             object.empty() ? "(default)" : object.c_str(), where.c_str(), v.parent);
@@ -580,7 +587,18 @@ bool apply(View& view, const Scene& s, double pitch, double yaw) {
         if (!ok) return false;
     } else {
         const ue::Prop p = ue::prop_of(target, view.property.empty() ? "ControlRotation" : view.property.c_str());
-        if (!p || !ue::add_rotator(target + p.offset, p.element_size, pitch, yaw)) return false;
+        if (!p) return false;
+        if (view.world_rotation) {
+            const char* why = nullptr;
+            if (!ue::add_world_rotation(target, p, pitch, yaw, why)) {
+                if (why != view.world_why)
+                    log("profile: view %u WorldRotation not applied to %s: %s", view.id, ue::name_of(target).c_str(), why);
+                view.world_why = why;
+                return false;
+            }
+        } else if (!ue::add_rotator(target + p.offset, p.element_size, pitch, yaw)) {
+            return false;
+        }
     }
     for (View::OnGyro& w : view.on_gyro) {
         const ue::Obj o = w.object.empty() ? target : resolve_path(w.object, s);
@@ -842,6 +860,14 @@ void status(const Scene& s, const View* view) {
         ue::name_of(ue::class_of(s.pawn)).c_str(), ue::name_of(ue::class_of(s.view_target)).c_str(), s.paused,
         s.cursor, gs.enabled, gs.motion_available, d.calibration_state, (unsigned long long)d.accepted_samples,
         d.stationary, d.bias.x, d.bias.y, d.bias.z, g_applied_yaw, g_applied_pitch);
+    // Object addresses, for a debugger (e.g. a write breakpoint on ControlRotation); logged when they change.
+    static ue::Obj last_pc = 0, last_pawn = 0, last_camera = 0;
+    if (s.pc != last_pc || s.pawn != last_pawn || s.camera != last_camera) {
+        last_pc = s.pc, last_pawn = s.pawn, last_camera = s.camera;
+        const ue::Prop cr = ue::prop_of(s.pc, "ControlRotation");
+        log("status: addresses pc=0x%llX (ControlRotation +0x%X) pawn=0x%llX camera=0x%llX", (unsigned long long)s.pc,
+            cr ? unsigned(cr.offset) : 0u, (unsigned long long)s.pawn, (unsigned long long)s.camera);
+    }
     log("status: motion %.0f samples/s, bursts every %.1f ms, updates every %.1f ms -> pacing %s", g_pacer.rate,
         g_pacer.gap_mean * 1000, g_pacer.frame_mean * 1000,
         !g_pacer.enabled ? "off (Pacing=0)"

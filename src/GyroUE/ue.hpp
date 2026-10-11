@@ -50,6 +50,14 @@ Obj struct_type(const Prop& p);              // UScriptStruct* of a StructProper
 bool add_rotator(uintptr_t address, int32_t element_size, double pitch, double yaw);
 bool read_rotator(uintptr_t address, int32_t element_size, double& pitch, double& yaw, double& roll);
 
+// Scene components with absolute rotation (their RelativeRotation is the world rotation) keep that rotation twice:
+// in RelativeRotation and in the non-reflected ComponentToWorld transform, which is what game code reads back
+// (Severed Steel turns its FirstPersonCamera from it every frame). Turning such a component means writing both.
+// `relative` is the component's RelativeRotation property. On failure `why` says why (nothing was written).
+bool add_world_rotation(Obj component, const Prop& relative, double pitch, double yaw, const char*& why);
+// The component's ComponentToWorld rotation holds its RelativeRotation (absolute rotation, layout found).
+bool has_world_rotation(Obj component, const Prop& relative);
+
 // Diagnostics / profile helpers for scalar properties (Float, Double, Int, Byte, Bool).
 void dump_props(Obj o, const char* stop_at_class);  // log every property down to (not including) stop_at_class
 std::string value_string(Obj o, const char* name);  // "" if missing or unsupported type

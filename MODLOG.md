@@ -742,6 +742,10 @@ UE4SS C++ mod built on GyroLib and no per-game code in the common case. Design b
   Docs (README, TROUBLESHOOTING, ADVANCED, AGENTS, CREDITS, BENCHMARKS) updated. Already-installed games keep their
   current name; the installer removes the other name when redeploying. Not yet run in game.
 
+- 2026-10-11 **Release numbering:** production is still 0.6.18, so everything after it ships as **0.6.19**: the
+  guard-page fix below plus the Severed Steel work (status addresses, `WorldRotation=1`, probe ranking, profile). The
+  0.6.20 / 0.6.21 numbers were local test builds only (their zips deleted); the demo and Cronos were redeployed as 0.6.19.
+
 - 2026-10-10 **GyroUE 0.6.19: guarded reads no longer swallow stack guard-page hits** (ported from PSButtonsUE, see its
   MODLOG "Luto crash with v0.1.0"). `guarded_copy`, `guarded_store`, `scan_xor_loads` and `scan_heap_region` used
   `__except(EXCEPTION_EXECUTE_HANDLER)`. A stray but plausible pointer landing on another thread's stack guard page raised
@@ -753,6 +757,85 @@ UE4SS C++ mod built on GyroLib and no per-game code in the common case. Design b
   was attributed to this yet; it's a latent bug in the shared core. Built with `tools/build-gyroue.sh`, release zip
   packaged. Deployed to Luto (`D:\Epic\LutoF2kGB\Luto\Binaries\Win64`, `winmm.dll`, replacing 0.6.17; alongside
   PSButtonsUE 0.1.0 `dsound.dll` and scskiller `d3d12.dll`; generic profile, gyrolib.ini kept). Not run in game yet.
+
+- 2026-10-11 **Severed Steel (Demo, UE 4.27.2, exe `ThankYouVeryCool-Win64-Shipping.exe`, DX11).**
+  - **Crash at startup (0.6.18, also reported by a user on the full game):** the log stops after `gyro: settings ...`
+    (inside `gl_sdl_create`). UE crash report: EXCEPTION_ACCESS_VIOLATION reading 0x0 in `MSVCP140+0x12590` (the
+    internal lock routine behind `_Mtx_lock`) called from `gyrolib.dll`. The game ships the VC++ runtime 14.24 next to
+    its exe (`msvcp140*.dll`); the process loads that copy and `gyrolib.dll` (dynamic CRT, built with MSVC >= 14.40)
+    gets it too. Known MSVC break: binaries built with 14.40+ construct `std::mutex` with a constexpr constructor that
+    old `msvcp140` (< 14.40) can't lock. Our `winmm.dll` uses the static CRT and is not affected. Workaround verified:
+    renaming the game's `MSVCP140.dll` and `MSVCP140_2.dll` makes it start (system 14.51 runtime used). Real fix belongs
+    in GyroLib (static CRT `/MT`, or `_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR` on all its C++ code); reported upstream by
+    the user.
+  - **Camera not found yet.** The generic view does nothing (user: no movement, no jitter). Auto probe: the profile it
+    wrote (Pawn raw 0x1284,0x818), ReplicatedControlRotation and all raw Pawn rotators at once (0x7EC, 0x818, 0x1278,
+    0x1284) are all ignored: 0x7EC/0x818/0x1284 snap back to the camera every frame, 0x1278 keeps our writes but isn't
+    read. Manual probe (F7/F8, 4 diffs, yaw only): every rotator, float and raw value that moves is a copy of
+    `PC.ControlRotation` (= POV), or yaw - 90 (Pawn+0xCF8, Pawn+0x1D20, HeadSpringArm). So ControlRotation is rebuilt
+    every frame from a source outside the probe's roots or in another form (vector, quaternion).
+  - **GyroUE 0.6.19 (test build 0.6.20 during the session):** the status block logs `status: addresses pc=0x... (ControlRotation +0x...) pawn=0x...
+    camera=0x...` whenever they change, for a debugger write breakpoint on ControlRotation (next step: find who writes
+    it each frame). Deployed to the Severed Steel demo (`winmm.dll`, generic view, the probe's profile parked as
+    `.ini.probe`).
+  - **Write breakpoint on `PC.ControlRotation.Yaw` (cdb, `ba w4`, 6 hits):** besides GyroUE's own writes (several per
+    frame: the game pumps messages from more than one place, each runs `hooked_peek`), the only writer is
+    `movsd [rbx+288h], xmm0` after an `Equals` tolerance test, i.e. `APlayerController::SetControlRotation`, once per
+    frame, called through the Blueprint VM (ProcessEvent / script frames on the stack). So a Blueprint computes the view
+    rotation from its own state each frame and sets it; ControlRotation is never read back. Candidate state: Pawn+0x1D20
+    (unwrapped yaw - 90, looks accumulated) and Pawn+0xCF8 (wrapped yaw - 90), both raw and not reflected floats, so
+    probably inside a Vector/Transform BP variable. Next: `Dump=1` on the pawn to name them.
+  - cdb note: quitting with `qd` from inside a `ba` command string ended the game process (no crash report). Detach
+    with a cleared breakpoint (`bc *; .detach; q`) next time.
+  - Correction: the caller is native, not Blueprint. `Dump=1` on the pawn: `PlayerCharacter` (native C++ class under
+    `ALSBaseCharacter`) has 419 reflected properties; +0x1D20 sits in an unreflected gap (0x1D04-0x1D2B). Writing it
+    (`Offsets=0x1D1C`) is ignored too (yaw snaps back, pitch at 0x1D1C keeps our writes but isn't read).
+  - Static disassembly (`cdb -z` on the exe, addresses relative to its preferred base): PlayerCharacter's tick reads
+    the look input `+0xBD8` (yaw) and `+0xBDC` (pitch), calls two functions (yaw, pitch) that turn the
+    `FirstPersonCamera` component (`+0x12A0`) from its current world rotation (`ComponentToWorld` quat at comp+0x1C0,
+    cached rotator at comp+0x190), then `Controller->SetControlRotation(camera world rotation)` (vtable +0x688). So
+    ControlRotation is an output of the camera component. Writing `Pawn.FPCamera.RelativeRotation` is ignored as well
+    (user: nothing, standing or walking): the camera's world rotation isn't driven by its RelativeRotation.
+  - The look inputs are written by the game's axis handlers every frame: the mouse handlers store
+    `+0xBD8`/`+0xBDC` unconditionally (0 when the mouse is still); the gamepad ones only past a dead zone, into
+    `+0xBD8`/`+0xBDC` or `+0x1B2C`/`+0x1BC4` depending on two settings bytes (`[pawn+0x1228]+0xDFD/0xDFE`). They run in
+    the PlayerController's input processing, after our PeekMessage frame, so writes there are overwritten too.
+  - ~~Conclusion: no memory location GyroUE can write drives this camera.~~ **Wrong, corrected on review:** the
+    look functions (pitch one at `0x141705510`, preferred image base) read the camera's world rotation
+    (ComponentToWorld quat at comp+0x1C0, rotator cache comp+0x180/0x190), apply the input (pitch clamped to
+    StandingPitchMin/Max, pawn+0x14A4/0x14A0) and call `SetWorldRotation` on the camera (quat path while falling,
+    rotator path otherwise). So the persistent state IS the camera's world rotation. The camera uses absolute
+    rotation (its RelativeRotation equals its world rotation while the capsule is turned too). Writing RelativeRotation
+    alone failed because the game rebuilt it from the stale ComponentToWorld in the same frame.
+  - USceneComponent layout seen (UE 4.27, float): RelativeRotation +0x128, WorldRotationCache +0x180 (quat) / +0x190
+    (rotator), RelativeRotationCache +0x1A0 / +0x1B0, ComponentToWorld +0x1C0 (rotation quat first).
+  - **One-shot proof (cdb noninvasive, `ed` with float bit patterns; `ef` can't parse negative numbers):** wrote
+    RelativeRotation yaw 91.31 -> 136.31 plus the matching quaternion at +0x1C0. Read back seconds later: both kept,
+    and `PC.ControlRotation` became (P -2.64, Y 136.31) by itself. User: the camera turned 45 degrees and stayed,
+    and the stick keeps working from there.
+  - **GyroUE 0.6.19 (test build 0.6.21 during the session): `WorldRotation=1`** (view option, with `Property=RelativeRotation`). `ue::add_world_rotation`
+    finds ComponentToWorld by value once per component class (16-byte aligned quat in the SceneComponent part equal
+    to quat(RelativeRotation), skipping the two rotation caches, which are followed by the same rotator; floats or
+    doubles from the property size), checks every frame that the stored quat still matches RelativeRotation (else
+    skips the frame and logs the reason when it changes), adds the delta (pitch kept within +-89 so the rotator
+    doesn't flip) and writes the rotator and quaternion (FRotator::Quaternion formula). Probe: an attached
+    component's `RelativeRotation` whose world rotation matches it is now a usable candidate (`WorldRotation=1` in
+    the suggestion) instead of "component transform (output)"; a CameraComponent ranks first. Root components stay
+    outputs (actor rotation). ADVANCED.md: Example 3 + key docs.
+  - Deployed the 0.6.21 test build to the Severed Steel demo with `Object=Pawn.FPCamera`, `Property=RelativeRotation`,
+    `WorldRotation=1`. **Verified (user, DualSense): smooth and correct.** Log: `ue: CameraComponent
+    ComponentToWorld rotation at +0x1C0 (absolute rotation, float)` at the first gameplay frame, `camera: confirmed`
+    3 s later, no `WorldRotation not applied` lines. Profile added as `profiles/ThankYouVeryCool-Win64-Shipping.ini`;
+    README lists Severed Steel with the msvcp140 rename note. Test profiles removed from the demo folder.
+  - **Probe verified (0.6.21 test build, no profile, Probe=1, 3 scored stick captures):** the profile it wrote picks
+    `Object=Pawn.FPCamera`, `Property=RelativeRotation`, `WorldRotation=1` (CameraComponent ranked first); the old
+    picks (Pawn raw 0x1284,0x818, RightHandSpringArm raw 0x258, ReplicatedControlRotation) and
+    `Pawn.RIghtHandGripLoc` RelativeRotation + WorldRotation=1 follow as alternatives. User restarted with it: works
+    (`camera: confirmed`). The repo profile was put back afterwards.
+  - **Regression check, Cronos (UE 5.4.4) updated 0.6.14 -> 0.6.21 test build (`version.dll`), no profile, Probe=1, 4 scored
+    captures:** the pick is unchanged, `Object=Pawn.View`, `Offsets=0x2A0,0x420`, `RotatorSize=24` (alternatives
+    Pawn.SpringArm raw 0x2D8 and Pawn.Animation.LastAimRotation); no WorldRotation candidate appeared. User restarted
+    with it: works (`camera: confirmed`). Verified profile restored, Probe=0.
 
 ## Status summary (2026-10-08)
 - Pacific Drive: **done** (on foot + car profile, in-game panel, calibration). Install:
