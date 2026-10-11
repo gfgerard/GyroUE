@@ -742,6 +742,10 @@ UE4SS C++ mod built on GyroLib and no per-game code in the common case. Design b
   Docs (README, TROUBLESHOOTING, ADVANCED, AGENTS, CREDITS, BENCHMARKS) updated. Already-installed games keep their
   current name; the installer removes the other name when redeploying. Not yet run in game.
 
+- 2026-10-11 **Release: GyroUE 0.7.0** (minor bump, user's decision: new features, not only fixes). Contains
+  everything after 0.6.18 that was numbered 0.6.19 below: guard-page fix, gyro-camera notice wording,
+  `WorldRotation=1` + probe ranking + Severed Steel profile, GyroLib 1.3.1 (GyroUE pacer removed), dependency check
+  (`deps.cpp`). Zip `build/release/GyroUE-v0.7.0.zip` (gyrolib.dll = the 1.3.1 SDK's).
 - 2026-10-11 **Release numbering:** production is still 0.6.18, so everything after it ships as **0.6.19**: the
   guard-page fix below plus the Severed Steel work (status addresses, `WorldRotation=1`, probe ranking, profile). The
   0.6.20 / 0.6.21 numbers were local test builds only (their zips deleted); the demo and Cronos were redeployed as 0.6.19.
