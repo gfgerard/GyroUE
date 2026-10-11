@@ -837,6 +837,27 @@ UE4SS C++ mod built on GyroLib and no per-game code in the common case. Design b
     Pawn.SpringArm raw 0x2D8 and Pawn.Animation.LastAimRotation); no WorldRotation candidate appeared. User restarted
     with it: works (`camera: confirmed`). Verified profile restored, Probe=0.
 
+- 2026-10-11 **GyroUE 0.6.19: dependency check before loading GyroLib (`deps.cpp`).**
+  - Why: GyroLib (1.3.0 and 1.3.1) links the VC++ runtime as DLLs (MSVCP140, MSVCP140_2, VCRUNTIME140,
+    VCRUNTIME140_1; linker 14.51) and delay-loads SDL3.dll. Windows shares a DLL by name, so a copy the game already
+    loaded, or one next to its exe (searched before System32), is the one GyroLib gets. Re-checked with 1.3.1 in a
+    standalone test (static-CRT exe + gyrolib.dll + the demo's 14.24 runtime copies in its folder): `gl_sdl_create`
+    segfaults; with the system's 14.51 runtime it works. So 1.3.1 still has the bug (good repro for the upstream report).
+  - What: `deps::check_gyrolib()` runs in `start_gyro()` before `LoadLibrary(gyrolib.dll)`. It reads gyrolib.dll's
+    linker version and its regular + delay-load imports (mapped with LOAD_LIBRARY_AS_IMAGE_RESOURCE, nothing runs),
+    finds the copy of each VC++ runtime DLL GyroLib would get (already loaded > exe folder > System32) and reads its
+    version from the module's version resource (not GetFileVersionInfo: version.dll is one of GyroUE's own proxy names).
+    MSVCP* older than 14.40 with GyroLib built by 14.40+ = blocking: GyroLib isn't loaded, the gyro stays off for the
+    session, the game starts normally, `deps:` log lines + a 45 s notice name the files and the fix (rename the game's
+    copies, or install the VC++ Redistributable if System32's copy is the old one). Older than the build tools but
+    14.40+ = log warning only. SDL3.dll already loaded by the game = log warning with both versions. Otherwise one
+    `deps:` info line per runtime DLL (useful in future crash reports).
+  - Tested on the Severed Steel demo (launched via Steam by the agent): with the game's 14.24 MSVCP140/MSVCP140_2 in
+    place, no crash, the main menu loads, the log names both files (MSVCP140 already loaded by the game) and the notice
+    is shown complete over the menu (screenshot); VCRUNTIME140/_1 14.24 only warn. With the two files renamed back to
+    `-bak`: info lines (MSVCP140 14.51 from System32), `gyro: SDL reader started`. TROUBLESHOOTING, ADVANCED (log
+    reference) and README updated.
+
 ## Status summary (2026-10-08)
 - Pacific Drive: **done** (on foot + car profile, in-game panel, calibration). Install:
   `games/PacificDrive/deploy-gyroue.sh "<Win64 dir>"`; uninstall with `remove`. UE4SS is parked as `dwmapi.dll.off`.

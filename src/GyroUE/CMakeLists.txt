@@ -14,7 +14,7 @@ target_include_directories(minhook PUBLIC "${MINHOOK_DIR}/include")
 
 # Version resource (file properties: description, product name, version) from project() above.
 configure_file(version.rc.in "${CMAKE_CURRENT_BINARY_DIR}/version.rc" @ONLY)
-add_library(GyroUE SHARED dllmain.cpp proxy.cpp host.cpp hooks.cpp overlay.cpp perf.cpp ue.cpp log.cpp notify.cpp proxy.def
+add_library(GyroUE SHARED dllmain.cpp proxy.cpp host.cpp hooks.cpp overlay.cpp perf.cpp ue.cpp log.cpp notify.cpp deps.cpp proxy.def
             "${CMAKE_CURRENT_BINARY_DIR}/version.rc")
 set_target_properties(GyroUE PROPERTIES OUTPUT_NAME winmm)
 target_compile_definitions(GyroUE PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE "GYROUE_VERSION=\"${PROJECT_VERSION}\"")

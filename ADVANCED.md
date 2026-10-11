@@ -66,6 +66,7 @@ All diagnostics go to `GyroUE\GyroUE.log` (probe results, if enabled, to `GyroUE
 | Camera drifts slowly | Rest the pad in a menu for a few seconds (`bias=` in the status line should become non-zero) or use "Recalibrate gyro". |
 | Panel doesn't open | Look for `overlay:` lines. Try from the game's pause menu. As a fallback, edit `gyrolib.ini` directly. |
 | Double motion | Steam Input or another tool is also converting the gyro to mouse. |
+| `deps:` lines | Before loading GyroLib, GyroUE checks which copy of each DLL GyroLib shares with the game (Visual C++ runtime, SDL3): one already loaded by the game, or one next to its exe, is the one GyroLib gets. `older than 14.40, GyroLib ... would crash the game` turns the gyro off for the session (the game still starts) and shows the fix: rename the game's copies so Windows' newer ones are used. `older than GyroLib's build tools` and `the game's own SDL3` are warnings only. |
 
 ## How it works
 

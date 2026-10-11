@@ -1,5 +1,6 @@
 #include "host.hpp"
 
+#include "deps.hpp"
 #include "log.hpp"
 #include "notify.hpp"
 #include "overlay.hpp"
@@ -320,6 +321,7 @@ void load_profile() {
 
 bool start_gyro() {
     const std::wstring dll = g_mod_dir + L"\\gyrolib.dll";
+    if (!deps::check_gyrolib(dll)) return false;  // the game's own runtime DLLs would crash GyroLib
     if (!LoadLibraryW(dll.c_str())) {
         log("gyro: cannot load %s (error %lu)", narrow(dll).c_str(), GetLastError());
         return false;
