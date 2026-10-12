@@ -1,15 +1,7 @@
 # MODLOG: universal gyro aiming for UE4/UE5 games
 
-Goal: DualSense gyro turns the real game camera in standard UE4/UE5 single-player games, with one
-UE4SS C++ mod built on GyroLib and no per-game code in the common case. Design brief:
-`gyrolib-ue-review.md`.
-
-## Status
-
-- 2026-10-08: project started. GyroLib v1.2.2 reviewed (verdict: feasible, with per-game profiles for
-  menus/ADS/vehicles). Nothing built or tested yet.
-- 2026-10-08: Pacific Drive (UE 4.27) chosen as first UE4 target; recon done, saves backed up.
-- 2026-10-08: GyroUE v0.2.1 (standalone version.dll + GyroLib, DX12 settings panel) working in Pacific Drive.
+Goal: DualSense gyro turns the real game camera in standard UE4/UE5 single-player games, without mouse emulation 
+or gyro to stick.
 
 ## Findings
 
