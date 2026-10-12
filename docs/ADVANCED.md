@@ -43,7 +43,7 @@ play.
 | Life is Strange Remastered | UE 4 (pre-4.25 property system), DX11 | yes (shipped) | Found with the camera probe. The camera splits pitch and yaw across two raw rotators, and the walking camera blends back to an automatic follow camera unless it gets look input; the profile writes `OnGyro=` to keep it manual. No settings panel (DX11): configure via `gyrolib.ini`. |
 | Luto | UE 5.5.4 | no | Generic path working OOB. Only reads XInput: GyroUE shows the DualSense / Switch Pro as an Xbox controller (Epic, no Steam Input). |
 | The Outer Worlds: Spacer's Choice Edition | UE 4 | no | Generic path. Native DualSense (delay-loaded `libScePad.dll`): XInput translation stays off. |
-| Hogwart's Legacy | UE 4 | yes | Third person detached camera, new objects detected. Native DualSense (delay-loaded `libScePad.dll`): XInput translation stays off. |
+| Hogwarts Legacy | UE 4 | yes | Third person detached camera, new objects detected. Native DualSense (delay-loaded `libScePad.dll`): XInput translation stays off. |
 
 
 Tested with a DualSense over USB/BT and Nintendo Switch Pro Controller. Requirements and limits:
