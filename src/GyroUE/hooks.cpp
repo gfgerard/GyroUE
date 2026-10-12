@@ -23,6 +23,9 @@ struct Hook {
     void* replacement;
     void** original;
     bool warned = false;
+    std::string from;  // DLL name of the first import patched (e.g. "XINPUT1_4.dll")
+    WORD ordinal = 0;  // nonzero: match imports by this ordinal (dll required) instead of by name
+    bool pad_library = false;  // also patched in Sony's pad library DLL (libScePad*.dll)
 };
 
 std::recursive_mutex g_mutex;
@@ -57,6 +60,16 @@ bool is_game_module(HMODULE m) {
     return name.rfind(g_prefix, 0) == 0;
 }
 
+// Sony's PC pad library shipped as its own DLL (libScePad.dll): it opens the controller itself, so the hooks that must
+// see that are patched in it too. Not a game module otherwise (no memory scans, no import checks).
+bool is_pad_library(HMODULE m) {
+    wchar_t path[MAX_PATH];
+    if (!GetModuleFileNameW(m, path, MAX_PATH)) return false;
+    std::wstring name = path;
+    name = lower(name.substr(name.find_last_of(L"\\/") + 1));
+    return name.rfind(L"libscepad", 0) == 0;
+}
+
 // API-set names (api-ms-win-*, ext-ms-win-*) stand for system DLLs: GDK/OneCore builds import user32
 // functions as e.g. ext-ms-win-ntuser-message-l1-1-0.dll!PeekMessageW. The function name decides then.
 bool dll_matches(const char* imported, const char* wanted) {
@@ -87,44 +100,89 @@ void* system_target(const Hook& hook) {
     return m ? reinterpret_cast<void*>(GetProcAddress(m, hook.function)) : nullptr;
 }
 
-// Patch one hook in one module's import table. Returns true if the slot now points to the hook.
+// Patch the slots of one imported DLL (regular or delay-load table). Returns true if a slot now points to the hook.
+// A delay-load slot that hasn't been called yet points to the linker's resolver stub inside the module itself, not
+// to the real function: it is patched (so the stub never runs) but doesn't count as the original.
+bool patch_slots(HMODULE module, const char* dll, const IMAGE_THUNK_DATA64* names, IMAGE_THUNK_DATA64* slots, Hook& hook,
+                 bool delay) {
+    const auto base = reinterpret_cast<uintptr_t>(module);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    const uintptr_t end = base + nt->OptionalHeader.SizeOfImage;
+    bool patched = false;
+    if (hook.ordinal && _stricmp(dll, hook.dll) != 0) return false;  // ordinals only mean something for that exact DLL
+    void* const target = system_target(hook);
+    for (; slots->u1.Function; ++slots, names = names ? names + 1 : nullptr) {
+        // Match by name; without a name table (stripped by some linkers/protectors), by resolved address. Ordinal hooks
+        // match ordinal imports only (the Windows SDK's xinput.lib imports XInput by ordinal).
+        if (hook.ordinal) {
+            if (!names || !IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal) || IMAGE_ORDINAL64(names->u1.Ordinal) != hook.ordinal) continue;
+        } else if (names && names->u1.AddressOfData && !IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) {
+            const auto* by_name = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
+            if (std::strcmp(by_name->Name, hook.function) != 0) continue;
+        } else if (!target || reinterpret_cast<void*>(slots->u1.Function) != target) {
+            continue;
+        }
+        void* current = reinterpret_cast<void*>(slots->u1.Function);
+        if (current == hook.replacement) {
+            patched = true;
+            continue;
+        }
+        const bool unresolved = delay && slots->u1.Function >= base && slots->u1.Function < end;
+        if (unresolved) {
+            // The DLL may not be loaded yet (no LoadLibrary here: this can run in DllMain); then the caller resolves the
+            // original itself from source_dll().
+            if (!*hook.original)
+                if (HMODULE loaded = GetModuleHandleA(dll))
+                    *hook.original = reinterpret_cast<void*>(
+                        GetProcAddress(loaded, hook.ordinal ? MAKEINTRESOURCEA(hook.ordinal) : hook.function));
+        } else if (!*hook.original) {
+            *hook.original = current;
+        } else if (current != *hook.original) {
+            if (!hook.warned)
+                log("hooks: %s in module %p resolves elsewhere (%p); such modules are left alone", hook.function,
+                    static_cast<void*>(module), current);
+            hook.warned = true;
+            continue;
+        }
+        DWORD old = 0;
+        if (!VirtualProtect(&slots->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) continue;
+        slots->u1.Function = reinterpret_cast<ULONGLONG>(hook.replacement);
+        VirtualProtect(&slots->u1.Function, sizeof(void*), old, &old);
+        if (hook.from.empty()) hook.from = dll;
+        if (delay || hook.ordinal)
+            log("hooks: %s!%s%s patched in the %s table of module %p%s", dll, hook.function,
+                hook.ordinal ? (" (ordinal " + std::to_string(hook.ordinal) + ")").c_str() : "", delay ? "delay-load" : "import",
+                static_cast<void*>(module), unresolved ? " (not called yet)" : "");
+        patched = true;
+    }
+    return patched;
+}
+
+// Patch one hook in one module's import tables (regular and delay-load). Returns true if a slot now points to the hook.
 bool patch_module(HMODULE module, Hook& hook) {
     const auto base = reinterpret_cast<uintptr_t>(module);
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
-    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!dir.VirtualAddress) return false;
     bool patched = false;
-    void* const target = system_target(hook);
-    for (auto* imp = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); imp->Name; ++imp) {
-        if (!dll_matches(reinterpret_cast<const char*>(base + imp->Name), hook.dll)) continue;
-        auto* names = imp->OriginalFirstThunk ? reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + imp->OriginalFirstThunk) : nullptr;
-        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imp->FirstThunk);
-        for (; slots->u1.Function; ++slots, names = names ? names + 1 : nullptr) {
-            // Match by name; without a name table (stripped by some linkers/protectors), by resolved address.
-            if (names && names->u1.AddressOfData && !IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) {
-                const auto* by_name = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
-                if (std::strcmp(by_name->Name, hook.function) != 0) continue;
-            } else if (!target || reinterpret_cast<void*>(slots->u1.Function) != target) {
-                continue;
-            }
-            void* current = reinterpret_cast<void*>(slots->u1.Function);
-            if (current == hook.replacement) {
-                patched = true;
-                continue;
-            }
-            if (!*hook.original) *hook.original = current;
-            else if (current != *hook.original) {
-                if (!hook.warned)
-                    log("hooks: %s in module %p resolves elsewhere (%p); such modules are left alone", hook.function,
-                        static_cast<void*>(module), current);
-                hook.warned = true;
-                continue;
-            }
-            DWORD old = 0;
-            if (!VirtualProtect(&slots->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) continue;
-            slots->u1.Function = reinterpret_cast<ULONGLONG>(hook.replacement);
-            VirtualProtect(&slots->u1.Function, sizeof(void*), old, &old);
-            patched = true;
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (dir.VirtualAddress) {
+        for (auto* imp = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); imp->Name; ++imp) {
+            const char* dll = reinterpret_cast<const char*>(base + imp->Name);
+            if (!dll_matches(dll, hook.dll)) continue;
+            auto* names = imp->OriginalFirstThunk ? reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + imp->OriginalFirstThunk) : nullptr;
+            auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imp->FirstThunk);
+            patched = patch_slots(module, dll, names, slots, hook, false) || patched;
+        }
+    }
+    // Delay-load imports (UE5 delay-loads XINPUT1_4.dll, for example): same layout, RVAs in a different descriptor.
+    const auto& delay = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    if (delay.VirtualAddress) {
+        for (auto* imp = reinterpret_cast<const IMAGE_DELAYLOAD_DESCRIPTOR*>(base + delay.VirtualAddress); imp->DllNameRVA; ++imp) {
+            if (!imp->Attributes.RvaBased || !imp->ImportAddressTableRVA) continue;  // pre-VC7 layout (absolute VAs)
+            const char* dll = reinterpret_cast<const char*>(base + imp->DllNameRVA);
+            if (!dll_matches(dll, hook.dll)) continue;
+            auto* names = imp->ImportNameTableRVA ? reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + imp->ImportNameTableRVA) : nullptr;
+            auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imp->ImportAddressTableRVA);
+            patched = patch_slots(module, dll, names, slots, hook, true) || patched;
         }
     }
     return patched;
@@ -198,26 +256,39 @@ bool inline_hook(Hook& hook) {
     return status == MH_OK;
 }
 
-std::vector<HMODULE> loaded_game_modules() {
+// Game modules (exe first); with pad_libraries, also the loaded libScePad*.dll modules (listed apart).
+std::vector<HMODULE> loaded_game_modules(std::vector<HMODULE>* pad_libraries = nullptr) {
     std::vector<HMODULE> out;
     HMODULE mods[2048];
     DWORD needed = 0;
     if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) return out;
     const size_t n = std::min<size_t>(needed / sizeof(HMODULE), 2048);
     out.push_back(GetModuleHandleW(nullptr));
-    for (size_t i = 0; i < n; ++i)
-        if (mods[i] != out.front() && is_game_module(mods[i])) out.push_back(mods[i]);
+    for (size_t i = 0; i < n; ++i) {
+        if (mods[i] == out.front()) continue;
+        if (is_game_module(mods[i])) out.push_back(mods[i]);
+        else if (pad_libraries && is_pad_library(mods[i])) pad_libraries->push_back(mods[i]);
+    }
     return out;
+}
+
+// Patch hook i in module m once. Returns true if a slot points to the hook.
+bool patch_once(HMODULE m, size_t i) {
+    if (g_done.count({m, i})) return true;
+    if (!patch_module(m, g_hooks[i])) return false;
+    g_done.insert({m, i});
+    return true;
 }
 
 void patch_all() {
     std::lock_guard lock(g_mutex);
-    for (HMODULE m : loaded_game_modules()) {
-        for (size_t i = 0; i < g_hooks.size(); ++i) {
-            if (g_done.count({m, i})) continue;
-            if (patch_module(m, g_hooks[i])) g_done.insert({m, i});
-        }
-    }
+    std::vector<HMODULE> pads;
+    for (HMODULE m : loaded_game_modules(&pads))
+        for (size_t i = 0; i < g_hooks.size(); ++i) patch_once(m, i);
+    for (HMODULE m : pads)
+        for (size_t i = 0; i < g_hooks.size(); ++i)
+            if (g_hooks[i].pad_library && !g_done.count({m, i}) && patch_once(m, i))
+                log("hooks: %s patched in the pad library module %p", g_hooks[i].function, static_cast<void*>(m));
 }
 
 HMODULE WINAPI hk_load_w(LPCWSTR name) {
@@ -262,24 +333,67 @@ void init(const wchar_t* exe_stem) {
         g_inline ? "inline hooks on exports" : "import-table hooks");
 }
 
-bool add(const char* dll, const char* function, void* replacement, void** original) {
+namespace {
+
+bool register_hook(const char* dll, WORD ordinal, const char* function, void* replacement, void** original, bool pad_library) {
+    if (ordinal && !dll) return false;
     std::lock_guard lock(g_mutex);
     g_hooks.push_back({dll, function, replacement, original});
     const size_t index = g_hooks.size() - 1;
+    g_hooks[index].ordinal = ordinal;
+    g_hooks[index].pad_library = pad_library;
     // Protected exe: its import slots are filled by the protector later, so hook the export itself.
     // LoadLibrary hooks (dll null) only serve modular builds' later modules and are skipped there.
     if (g_inline) return g_hooks[index].dll && inline_hook(g_hooks[index]);
     bool any = false;
-    for (HMODULE m : loaded_game_modules()) {
-        if (patch_module(m, g_hooks[index])) {
-            g_done.insert({m, index});
-            any = true;
-        }
-    }
+    std::vector<HMODULE> pads;
+    for (HMODULE m : loaded_game_modules(&pads)) any = patch_once(m, index) || any;
+    if (pad_library)
+        for (HMODULE m : pads)
+            if (patch_once(m, index)) log("hooks: %s patched in the pad library module %p", function, static_cast<void*>(m));
     return any;
 }
 
+}  // namespace
+
+bool add(const char* dll, const char* function, void* replacement, void** original) {
+    return register_hook(dll, 0, function, replacement, original, false);
+}
+
+bool add_ordinal(const char* dll, WORD ordinal, const char* function, void* replacement, void** original) {
+    return register_hook(dll, ordinal, function, replacement, original, false);
+}
+
+bool add_with_pad_library(const char* dll, const char* function, void* replacement, void** original) {
+    return register_hook(dll, 0, function, replacement, original, true);
+}
+
 bool inline_mode() { return g_inline; }
+
+std::string source_dll(const char* function) {
+    std::lock_guard lock(g_mutex);
+    for (const Hook& hook : g_hooks)
+        if (!hook.from.empty() && std::strcmp(hook.function, function) == 0) return hook.from;
+    return {};
+}
+
+std::vector<ImportedDll> imported_dlls() {
+    std::lock_guard lock(g_mutex);
+    std::vector<ImportedDll> out;
+    for (HMODULE module : loaded_game_modules()) {
+        const auto base = reinterpret_cast<uintptr_t>(module);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+        const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (dir.VirtualAddress)
+            for (auto* imp = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); imp->Name; ++imp)
+                out.push_back({reinterpret_cast<const char*>(base + imp->Name), false});
+        const auto& delay = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+        if (delay.VirtualAddress)
+            for (auto* imp = reinterpret_cast<const IMAGE_DELAYLOAD_DESCRIPTOR*>(base + delay.VirtualAddress); imp->DllNameRVA; ++imp)
+                if (imp->Attributes.RvaBased) out.push_back({reinterpret_cast<const char*>(base + imp->DllNameRVA), true});
+    }
+    return out;
+}
 
 std::vector<HMODULE> game_modules() {
     std::lock_guard lock(g_mutex);

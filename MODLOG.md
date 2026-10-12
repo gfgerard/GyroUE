@@ -742,6 +742,10 @@ UE4SS C++ mod built on GyroLib and no per-game code in the common case. Design b
   Docs (README, TROUBLESHOOTING, ADVANCED, AGENTS, CREDITS, BENCHMARKS) updated. Already-installed games keep their
   current name; the installer removes the other name when redeploying. Not yet run in game.
 
+- 2026-10-11 **GyroUE 0.8.0 = main's 0.7.0 merged into `feature/xinput-translation`** (user's decision: minor bump for
+  the XInput translation). Conflicts resolved: `host.cpp` default `GyroUE.ini` keeps `Notices` plus the XInput keys
+  (the `Pacing` keys are gone with the pacer), CMake builds `deps.cpp` and `xinput.cpp`, docs keep both sides. Builds
+  clean against GyroLib 1.3.1.
 - 2026-10-11 **Release: GyroUE 0.7.0** (minor bump, user's decision: new features, not only fixes). Contains
   everything after 0.6.18 that was numbered 0.6.19 below: guard-page fix, gyro-camera notice wording,
   `WorldRotation=1` + probe ranking + Severed Steel profile, GyroLib 1.3.1 (GyroUE pacer removed), dependency check
@@ -862,6 +866,266 @@ UE4SS C++ mod built on GyroLib and no per-game code in the common case. Design b
     `-bak`: info lines (MSVCP140 14.51 from System32), `gyro: SDL reader started`. TROUBLESHOOTING, ADVANCED (log
     reference) and README updated.
 
+- 2026-10-11 **GyroUE 0.8.0: SDL controller shown to the game as XInput** (branch `feature/xinput-translation`; the
+  local test builds deployed below were numbered 0.7.0 and 0.7.1 before main released its own 0.7.0).
+  Goal: games that only read XInput (UE's `XInputInterface`) and run without Steam Input (Epic: Luto) ignore a
+  DualSense / Switch Pro except for the gyro. New `xinput.cpp` answers the game's `XInputGetState` for one slot with the
+  SDL state of GyroLib's selected controller (`gl_output.physical_id` / `gl_get_selected_device` -> `gl_get_endpoint`
+  -> `gl_sdl_endpoint_for_instance` -> `SDL_GetGamepadFromID`, no extra reference), `XInputSetState` -> `SDL_RumbleGamepad`
+  (refreshed every 500 ms, 1 s duration), `XInputGetCapabilities`, `XInputEnable`, `XInputGetStateEx` (ordinal 100, adds
+  Guide 0x0400). State is built on the game thread right after `gl_update` and read under a mutex by the hooks.
+  - Findings: **Luto (UE 5.5.4) imports `XINPUT1_4.dll!XInputGetState/XInputSetState` by name through the delay-load
+    table**; `hooks.cpp` only walked the regular import table, so it now also walks `IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT`
+    (an unresolved slot points to the linker stub inside the module: it is patched before the first call, so the stub
+    never runs, and the original is resolved later from `hooks::source_dll()`). The **Windows SDK's `xinput.lib` imports
+    by ordinal** (xinput1_3/1_4: 2 GetState, 3 SetState, 4 GetCapabilities, 5 Enable, 100 GetStateEx; xinput9_1_0 uses
+    other ordinals but exports by name), hence the new `hooks::add_ordinal` (exact DLL name required).
+  - Only game modules are patched, so SDL in GyroLib (which loads XInput dynamically) never sees the virtual pad: no
+    feedback loop. That's also why it's off in inline-hook mode (protected exes): an export hook would reach SDL too.
+  - UE only re-polls empty XInput slots after `WM_DEVICECHANGE` (`bNeedsControllerStateUpdate`), so GyroUE posts
+    `WM_DEVICECHANGE(DBT_DEVNODES_CHANGED)` to the game thread's `UnrealWindow`s when the pad appears or goes. Not yet
+    verified in a real UE game.
+  - Settings (`GyroUE.ini`, profile overrides): `XInput` 0 off / 1 auto (default) / 2 always, `XInputNintendoLabels`
+    (swaps A<->B and X<->Y; the first version used `SDL_GetGamepadButtonLabel`, replaced by an unconditional
+    swap so it also works for pads SDL can't label), `XInputTouchpadBack` (touchpad click = View).
+  - Auto mode keeps it off when the pad is Xbox-type or has a Steam handle, when any real XInput slot is connected
+    (watcher thread, 1 s, so empty-slot polling never costs the game thread), or when the game reads pads itself:
+    `libScePad*.dll` or a non-GyroLib `SDL2/SDL3.dll` loaded, `RegisterRawInputDevices` usage page 1 / usage 4,5,8,
+    `CreateFileW` on `\\?\hid#vid_<selected pad vendor>`, or `DirectInput8Create` (all observed from game modules only).
+    It waits 2 s after the pad appears before showing it.
+  - While translating, GyroUE also declares `GL_HOST_NATIVE_STICK_SUPPRESSION` and zeroes the right stick when GyroLib
+    asks (`suppress_native_right_stick`, flick stick). Untested.
+  - Verified so far: builds clean (/W4); a stand-in exe (`*-Win64-Shipping.exe`, Windows SDK `xinput.lib` with
+    `/DELAYLOAD:XINPUT1_4.dll`, an `UnrealWindow`, PeekMessageW loop) gets `XINPUT1_4.dll!XInputGetState (ordinal 2)`
+    and `XInputSetState (ordinal 3)` patched in the delay-load table and its calls reach GyroUE. **No controller was
+    connected, so the translation itself, rumble and the `WM_DEVICECHANGE` re-poll are not verified yet; nothing run
+    in game.**
+  - Deployed to Luto (`winmm.dll`, replacing 0.6.19; existing `GyroUE.ini`/`gyrolib.ini` kept, so the new keys
+    take their defaults: `XInput=1` auto). Awaiting the in-game test.
+  - **Luto test of 0.7.0, DualSense (connection not reported), Epic, no Steam Input: works.** User: every input they
+    could try worked. Log: both delay-load slots patched before the first call; `DualSense Wireless Controller shown as
+    XInput controller 0` 2.8 s after the SDL reader started, `WM_DEVICECHANGE posted to 1 game window(s)`, and the game's
+    first `XInputGetState` call came 1.1 s later (so Luto doesn't poll XInput before its engine loop runs; whether the
+    `WM_DEVICECHANGE` was needed isn't proven). No auto-mode false positive (Raw Input, HID, DirectInput) in Luto.
+    Frame cost unchanged (idle avg ~58 us, active ~70 us).
+  - **Luto, Switch Pro over Bluetooth, no Steam Input: basic input works (user).** `Nintendo Switch Pro Controller shown
+    as XInput controller 0` 4.6 s after start, game's first poll 0.7 s later. Default mapping (by position).
+  - Decision: ship as **alpha with the default mapping**. Extra buttons stay unmapped for now (DualSense mic button,
+    Edge paddles/Fn, Switch Capture; PS/Home only through `XInputGetStateEx`). Ideas parked in "Ideas for later".
+  - **Terminator: Resistance (UE4, Steam)** imports `XINPUT1_3.dll` **by ordinal (2 GetState, 3 SetState) in the
+    regular import table**: covered by the ordinal hooks. Updated there from 0.6.17 to 0.7.0, kept as `version.dll`
+    (alongside PSButtonsUE `dsound.dll` and ReShade `dxgi.dll`). **Tested: works perfectly (user, DualSense)**; log:
+    ordinal 2/3 patched in the import table, `DualSense Wireless Controller shown as XInput controller 0`.
+- 2026-10-11 **GyroUE 0.8.0 (local test build 0.7.1): native pad libraries detected from the import tables.** The Outer Worlds: Spacer's Choice
+  (Epic, UE4, exe `IndianaEpicGameStore-Win64-Shipping.exe`, native DualSense) ships `libScePad.dll` and imports it
+  **through the delay-load table** (`scePadInit`, `scePadOpen`, `scePadReadState`, `scePadSetTriggerEffect`), plus
+  `XINPUT1_3.dll` by ordinal 2/3 and `RegisterRawInputDevices`. A delay-loaded libScePad only appears in the process on
+  the game's first scePad call, possibly after the 2 s grace, so 0.7.0 could show the pad as XInput and then withdraw
+  it. New `hooks::imported_dlls()` lists the game modules' regular and delay-load imports; auto mode treats an import of
+  `libScePad*` or `SDL2/SDL3.dll` as native support, checked in DllMain (`xinput::install`) and on every watcher pass
+  (modules loaded later). Deployed there as `winmm.dll` (replacing 0.6.18). Expected log: `xinput: the game reads
+  controllers itself: it imports Sony's pad library (libScePad.dll, delay-load, ...)` and `not shown`.
+  - **Tested (user, DualSense, Epic): all good.** Log: native support detected in DllMain from the import table, before
+    the pad was found; `DualSense Wireless Controller not shown: it imports Sony's pad library`; the game still polls
+    XInput (`XINPUT1_3` ordinals, real devices only), and its native DualSense input is untouched. Generic gyro path
+    works (`view=Camera`, `IndianaPlayerCharacter_BP_C`); main menu correctly `view=none` (DefaultPawn, CineCameraActor).
+
+- 2026-10-11 **Hogwarts Legacy (Steam, UE 4.27, exe `HogwartsLegacy.exe`, UE4SS 3.0.1 also installed), GyroUE 0.8.0.**
+  - **Engine not readable:** GUObjectArray found (`ObjObjects` at exe+0x97EB7E0, the same array UE4SS finds at
+    exe+0x97EB7D0) and FNamePool (header len high bits), but `detect_layout` fails every 5 s with `ue: core classes not
+    found` (UClass `Class` itself was found). So no scene, no view, gyro off, and no notice: the "camera ignores the
+    gyro" notice needs a view, and the probe needs the same reflection data. Not a regression: this code is unchanged
+    since the first commit; the game was never supported. UE4SS reports a standard UObjectBase (Class 0x10, Name 0x18,
+    Outer 0x20) but `FProperty::Offset_Internal = 0x4C` (stock 4.25+: 0x44), and resolves names through
+    `FName::ToString` rather than the pool, so the name decoding or the property layout may differ.
+  - Added: `ue: core classes missing: ...` logs once which of Object/Actor/Controller are missing, how many objects are
+    classes and the first 12 class names, and for each missing name the object with that name and its class (to tell
+    a name-decoding problem from a class-pointer one). After 60 s without readable engine data, GyroUE logs it and
+    shows a 20 s notice (game not supported yet, report it with the log) instead of staying silent.
+  - **XInput:** the DualSense was shown as XInput at +3 s, then withdrawn at +18 s when the game opened its HID device
+    (`it opens the controller's HID device itself (vendor 1356)`): Hogwarts has native DualSense support. User: the
+    notices appeared and the translation stopped correctly. The exe **imports `hid.dll`** (`HidD_GetFeature`,
+    `HidD_SetFeature`, `HidD_GetAttributes`, `HidP_GetCaps`...), which stock UE doesn't (Luto doesn't); UE's RawInput
+    plugin does, also native support. Auto mode now treats a `hid.dll` import as native, so such games never get the
+    XInput pad, not even for those 15 s.
+  - Built as 0.8.0 (user's decision: not released yet) and deployed to Hogwarts (`winmm.dll`). Waiting for the log with
+    the class diagnostics.
+  - **Diagnostics run (user, while the game compiled shaders):** `core classes missing: Controller; 9929 of 96600
+    objects are classes (first: Object, p, i, e, s, r, i, ...)`; Object (#1) and Actor (#22) were found. Single letters
+    = names decoded from the wrong memory. The 60 s notice fired too (correctly: the data really couldn't be read).
+  - **Root cause: a false FNamePool.** Read-only `ReadProcessMemory` look at the running game: the exe image holds three
+    qwords equal to name block 0. GyroUE took the first, rva 0x9754380 (CurrentBlock 0, block 1 null, blocks 2+ set
+    0x20000000 apart): it isn't the pool, so only block-0 names (Object 0x162, Actor 0x16A) decoded; index 0xFC10C
+    (block 15) landed in UTF-16 config text. The real pool is at **rva 0x97AF290** (CurrentBlock 131, blocks every
+    0x20000). Name entries are stock (2-byte header, len in the high 10 bits, stride 2).
+  - Fix in `find_name_pool`: a candidate must have every block up to CurrentBlock set and the next four null (the
+    allocator fills blocks in order). Checked against the live game: both false candidates rejected, the real one
+    accepted, and with it Controller (#828), PlayerController, PlayerCameraManager and GameEngine decode. All of those
+    exist from startup, so the engine can be read in menus/shader compilation too. Still open: UE4SS reports
+    `FProperty::Offset_Internal = 0x4C` (stock 0x44); `detect_layout` measures it at runtime, to be seen in game.
+  - **In game with the pool fix (user):** `ue: layout (FField properties, UE 4.25+) SuperStruct=0x40 ChildProperties=0x50
+    Field.Class=0x8 Field.Next=0x20 Field.Name=0x28 Property.ElementSize=0x3C Offset_Internal=0x4C sizeof(Property)=0x78`
+    (FField is 8 bytes larger than stock from Next on; detected at runtime, no change needed), `ue: engine GameEngine_...`,
+    `view: Camera`, `gyro on`. PC `BP_Phoenix_Player_Controller_C` (ControlRotation +0x2B0), pawn `BP_Biped_Player_C`,
+    view target **`BP_ThirdPersonCameraStackActor_C`** (gameplay) / `BP_SceneRigCameraStackActor_C` (scene rigs).
+    GyroUE writes ControlRotation (applied yaw grows) but no notice appeared: `follow_check` only judged the camera
+    when the view target is the pawn (other targets were taken as scripted cameras), and Hogwarts' gameplay camera
+    is its own actor. Also seen: calib=0 and bias 0 the whole session, so applied yaw drifted ~0.5 deg/s while the pad
+    lay still (no menu calibration happened yet).
+  - Fix: `player_camera()` also accepts a view target class whose camera turned 30+ degrees (POV) while the right
+    stick was held; logged once as `camera: view target X turns with the right stick: treated as the player's camera`.
+    Then the usual 2 s windows decide (notice to set Probe=1 if the gyro is ignored). The auto probe never had the
+    pawn-only filter. Built as 0.8.0; Hogwarts was running again, not deployed yet.
+  - **Probe run (user, DualSense, Probe=1, 5 scored captures):** `camera: view target BP_ThirdPersonCameraStackActor_C
+    turns with the right stick` logged as intended. Roots: PC `BP_Phoenix_Player_Controller_C`, camera manager
+    `PhoenixCameraStackManager`, view target `BP_ThirdPersonCameraStackActor_C`. Six rotations followed the camera every
+    time; five are outputs (`Camera.TransformComponent0` RelativeRotation and +0x1D0, both POV caches,
+    `ViewTarget.Camera(CameraStackCineComponent)+0x1B0`); the pick is raw float rotator **+0x1C8 in
+    `ViewTarget.CameraStackBehaviorConvertToTranslation_<n>`**. ControlRotation never followed (ignored by this camera).
+  - **The written profile couldn't work:** `Object=ViewTarget.CameraStackBehaviorConvertToTranslation_2147460121`, but
+    that number is a per-session generated name (`_2147460128` in the next session), so the object was never found.
+    Probe fix: a path step whose name is `<Class>_<digits>` is labelled `@Class` when `@Class` resolves to that same
+    object (first object of that class under the same outer, by index, as `find_subobject_of_class` does).
+    The deployed profile was edited by hand to `Object=ViewTarget.@CameraStackBehaviorConvertToTranslation`
+    (original kept as `HogwartsLegacy.ini.probe-original`), Probe=0. Whether +0x1C8 is an input or another output is
+    the open question for the next test.
+  - **Test of the @Class profile (user): no camera motion.** The object resolved
+    (`view object CameraStackBehaviorConvertToTranslation_2147460037 +0x1C8=(P -5.55 Y 158.49)`), but after the gyro
+    added 71.6 degrees the value was back at Y 158.49: +0x1C8 is rewritten every frame, another output.
+  - **Read-only memory hunt** (`ReadProcessMemory`, scratch script, game running): roots = the camera-stack objects,
+    pawn and PC (0x1000 bytes each) plus every heap block one pointer away (0x600 bytes); 12 snapshots taken while the
+    camera was still between stick turns (yaw both ways, pitch -18..+26); floats whose change matched the camera's in
+    every turn. Results: PC `ControlRotation` (+0x2B0) tracks the camera exactly (an output, which is why writing it
+    did nothing); **`BehaviorStack` (class `CameraStack`, subobject of the view target, also at view target +0x340)
+    holds a float rotator at +0x68 (P, Y, R) mirrored at +0x80**, about 3 degrees above the final pitch and slightly
+    behind in yaw (the base rotation before the stack's offsets/smoothing), which is why the probe (exact matches
+    only) missed it. Others: `CameraStackBehaviorMaintainTargetFraming+0x1D4` (yaw - 20),
+    `CameraStackBehaviorAddOffsetsWhileCrouching+0x418` (pitch), CineComponent +0x14C (yaw relative to the actor).
+  - **One-shot write proof (`WriteProcessMemory`, user agreed):** +45 yaw at BehaviorStack +0x6C and +0x84: camera
+    output -37.26 -> 7.75 and stayed (checked over 3 s); +10 pitch at +0x68 and +0x80: -20.89 -> -10.58, stayed.
+  - Profile `profiles/HogwartsLegacy.ini`: `Object=ViewTarget.BehaviorStack`, `Offsets=0x68,0x80`, `RotatorSize=12`
+    (the name has no instance number; it resolves as a subobject of the view target). Deployed; needs a game restart
+    and a gyro test. Lesson for the probe: a camera's state can be a smoothed/offset copy of the POV, not an exact
+    match; a delta-based scan (as above) would find it.
+
+- 2026-10-11 **Probe with live test (built as 0.8.0, not verified in game yet).** Why: the passive probe accepted any
+  rotation that held the camera's values and wasn't in a known output location, so outputs elsewhere slipped through
+  and became the profile (Hogwarts: `ConvertToTranslation+0x1C8`), while a look rotation kept with an offset was never
+  seen (Hogwarts: `BehaviorStack+0x68`, pitch 3 degrees above the POV). User's design: test every candidate by writing.
+  - Candidates (`follows()` in ue.cpp): a rotator that holds the POV's exact pitch/yaw, **or changed by the POV's
+    turn** (tolerance max(0.6, 3%) per axis; scored turns are 10+ degrees of yaw), reflected or raw, float or double.
+    `Candidate.exact` counts the exact hits. `probe_groups()` groups them (raw rotators of one object and size
+    together, as a profile writes them; reflected properties one by one), usable first, passive "outputs" after.
+  - Live test (host.cpp `run_live_test`, Probe=1 automatic mode only), after 3 scored captures, up to 40 groups:
+    camera at rest 600 ms, then a 250 ms null window (no drift > 0.2), write +3 yaw through the same `apply()` a
+    profile uses (so the object path, @Class, WorldRotation are exercised too); pass if the POV turns +3 (+-0.5)
+    within 700 ms and holds 150 ms, then the turn is undone and the camera must come back; then the same in pitch
+    (towards level). Fail: `overwritten (output)` (value rewritten) or `kept, camera didn't move`. Round 2 retests the
+    passes; a pass in round 1 only is `inconsistent`. Stick, pause, cursor, focus loss or another view target abort a
+    test and undo its turn (pending until it can be written), 3 retries. Notes whether the pawn's own rotation turned.
+  - Result: a verified group becomes the profile (or `.suggested.ini` if the game had one), header `VERIFIED LIVE`;
+    otherwise up to 8 captures, testing the new candidates each time, then only an unverified `.suggested.ini`. **An
+    unverified guess is never written as the game's profile any more** (also for manual F7/F8 diffs). The gyro stays
+    paused until the probe is done. On-screen notices guide each step.
+  - Deployed to Hogwarts with the working profile set aside (`HogwartsLegacy.ini.verified`) and Probe=1, to check
+    that the probe finds and verifies BehaviorStack by itself and rejects +0x1C8.
+  - **First run (user, Hogwarts, 3 captures): it verified the wrong camera.** 8 groups tested: MotionCamera raw
+    and TransformComponent0 raw `kept, camera didn't move`; the RelativeRotations `overwritten (output)`;
+    **`ViewTarget.Camera` (CameraStackCineComponent) raw 0x1B0,0x1D0 MOVES THE CAMERA** in both rounds, written as
+    the profile. User: it works, but it is a free camera (no arm: it turns on the spot instead of orbiting the
+    character). BehaviorStack +0x68/+0x80 was a candidate in captures 1 and 2 but not in capture 3 (52 degrees of
+    pitch: its offset to the POV depends on the pitch, framing), so the old every-capture rule kept it out of the
+    test. Also a candidate: `BP_RotationLag_GamepadInput_C` +0x1E0/+0x1EC/+0x1F8 (captures 1-2).
+  - Fixes: (1) groups need most scored diffs, at least two (`max(2, (n+1)/2)`), since the live test decides; (2)
+    **orbit check**: every capture measures how far the camera's POV location moves for the turn's view angle
+    (radius = chord / (2 sin(angle/2)), median of the captures, logged); with a radius of 30+ units (third
+    person) a candidate's +3 yaw must also move the camera at least 40% of the expected chord, else verdict
+    `kTurnsInPlace` (turned the view in place, not like the stick). First-person cameras (radius about 0) skip it.
+    `ue::camera_pov_location` reads `CameraCachePrivate.POV.Location` (float or double). Redeployed; the free
+    camera profile kept as `HogwartsLegacy.ini.probe-freecam`, Probe=1 again.
+  - **Second run (user, Hogwarts, DualSense, 3 captures): correct.** Orbit radius 235/205/202 (median 205, third
+    person). 15 groups tested: **`ViewTarget.BehaviorStack` raw 0x68,0x80 MOVES THE CAMERA in both rounds (yaw and
+    pitch; camera moved 10.7 / 10.8 for an expected 10.6)**; `ViewTarget.Camera` raw 0x1B0,0x1D0 rejected as turning in
+    place (moved 0.0 of 10.6); outputs rejected as overwritten (ConvertToTranslation +0x1C8, PC ControlRotation and
+    +0x8F0, BP_RotationLag_GamepadInput_C +0x1E0/+0x1EC/+0x1F8, RelativeRotations); MotionCamera and
+    TransformComponent0 raw kept without effect. The generated profile equals the hand-verified one. Fixed the
+    log label of kTurnsInPlace (it printed "not testable").
+  - **Regression check, Severed Steel demo (UE 4.27.2, first person), no profile, Probe=1, 3 captures (user: correct,
+    profile works).** Installed fresh as `winmm.dll` (the game's 14.24 `msvcp140.dll`/`msvcp140_2.dll` renamed to
+    `.bak` again, user agreed; the repo profile set aside as `.verified`). Orbit radius 0 in all captures (turns on the
+    spot), so no orbit check. 16 groups: **`Pawn.FPCamera.RelativeRotation` (WorldRotation=1)** and `Pawn.FPCamera` raw
+    0x190,0x1B0 both MOVE THE CAMERA in both rounds (noted: also turns the character, expected in first person); the
+    named property ranks first, so the profile equals the verified one. Outputs (Pawn raw 0x818,0x1284,
+    ReplicatedControlRotation, RIghtHandGripLoc, ControlRotation) overwritten; spring arm and TransformComponent0 raw
+    kept without effect. The live test exercised the WorldRotation write path.
+  - **Regression check, Cronos (UE 5.4.4, third person, double rotators), no profile, Probe=1, 3 captures (user: works).**
+    First attempt ran the old 0.6.19: the folder had GyroUE 0.6.19 as `version.dll` (loaded first) and 0.8.0 as
+    `winmm.dll` (stayed inactive, one GyroUE per process), so the old probe wrote an unverified profile after two
+    captures. Redeployed 0.8.0 as `version.dll` (the script removed `winmm.dll`). Orbit radius 190/166/194. 6 groups:
+    **`Pawn.View` raw 0x2A0,0x420 (RotatorSize 24) MOVES THE CAMERA in both rounds (camera moved 9.8 for an expected
+    9.6)**; SpringArm raw 0x2D8, Animation.LastAimRotation, TransformComponent0.RelativeRotation overwritten. The
+    profile equals the verified one. With Hogwarts and Severed Steel: the live-test probe reproduced all three
+    verified profiles by itself (third person / first person with WorldRotation / UE5 double raw rotators).
+
+- 2026-10-12 **Luto, GyroUE 0.8.0 (local build): flick stick and `XInputNintendoLabels` tested (user: works as it
+  should).** `XInputNintendoLabels=1` now swaps A<->B and X<->Y unconditionally (any controller) instead of relying on
+  `SDL_GetGamepadButtonLabel`. Tested with a DualSense (swap applied), Epic, no Steam Input: `XInput=1 (auto)
+  XInputNintendoLabels=1`, `DualSense Wireless Controller shown as XInput controller 0`. GyroLib flick stick
+  (`context.1.flick.mode=2`) works with the translated pad: `GL_HOST_NATIVE_STICK_SUPPRESSION` is advertised while the
+  pad is shown as XInput and the virtual pad's right stick is zeroed when GyroLib asks (`suppress_native_right_stick`).
+
+- 2026-10-12 **`XInput=2` now keeps the game from reading PlayStation/Nintendo controllers itself.** Before, `XInput=2` in a game with native DualSense support gave double input (native + translated).
+  - Finding (`dumpbin /imports`): `libScePad.dll` (Pacific Drive, It Takes Two) imports exactly the `hid.dll` set that
+    Hogwarts Legacy, Cronos, Banishers, Days Gone and Jedi: Fallen Order import from their exe (HidD_GetAttributes/
+    GetFeature/SetFeature/Get*String/GetHidGuid/GetPreparsedData, HidP_GetCaps/GetValueCaps, plus SetupDi*, ReadFile,
+    GetOverlappedResult(Ex)): those five most likely link Sony's pad library statically. Either way the controller is
+    opened with `CreateFileW` on its HID path.
+  - Change: with `XInput=2` the `CreateFileW` hook (now installed in auto and always modes, and also patched into a
+    separate `libScePad*.dll` through `hooks::add_with_pad_library`) refuses HID paths of Sony (054C) and Nintendo
+    (057E) devices and of the selected controller with `ERROR_ACCESS_DENIED`; `RegisterRawInputDevices` entries for
+    joysticks/gamepads are dropped. HID path IDs are now parsed for Bluetooth paths too
+    (`_vid&0002054c_pid&0ce6`; before, only USB `vid_054c` was recognised by the auto-mode HID check).
+  - `XInput=2` now also stays off while a real XInput controller is connected (DS4Windows/DSX, Steam Input, Xbox pad):
+    the same pad through a remapper would act twice.
+  - **Tested, DualSense (user: works in both, no double input).** Pacific Drive (`XINPUT1_3`): `libScePad.dll` loads
+    after the controller is shown (+5 s) and is patched as it loads (`hooks: CreateFileW patched in the pad library
+    module`), then its first opens of `054C:0CE6` are refused 0.1 s later. Cronos (`XINPUT1_4` delay-load, Sony's
+    library in the exe): the exe's opens of `054C:0CE6` are refused right after its first `XInputGetState`. Both
+    show `DualSense Wireless Controller shown as XInput controller 0`. Bluetooth not tested yet.
+
+- 2026-10-12 **Native flick stick (`NativeFlickStick=1`, off by default (user), new `nativepad.cpp`).** Goal: GyroLib's
+  flick stick in games with their own DualSense support without giving it up for `XInput=2`. Switching between
+  native and XInput at runtime was rejected: the game keeps its HID handle open (a switch means faking a disconnect,
+  possibly a "controller disconnected" pause), and GyroLib's `suppress_native_right_stick` changes with views and the
+  aim context, so it would switch on every aim.
+  - All eight native-DualSense games checked read through Sony's pad library (separate or linked in), which opens the
+    pad with `CreateFileW` and reads with `ReadFile` + `GetOverlappedResult(Ex)` (It Takes Two's older
+    `libScePad.dll` imports only `ReadFile`: synchronous reads, handled too).
+  - `nativepad.cpp` now owns the `CreateFileW` hook (moved from `xinput.cpp`: XInput=2 refusal and auto mode's
+    opened-vendor check use it through `nativepad::refuse_pads` / `opened_vendor`) and adds `ReadFile`,
+    `GetOverlappedResult(Ex)` and `CloseHandle` (game modules + `libScePad*.dll`). Sony handles opened with read
+    access are followed (max 8; a handle value reused by another `CreateFileW` or closed is dropped); pending
+    overlapped reads are matched by `OVERLAPPED*` and handled when `GetOverlappedResult(Ex)` reports them done.
+  - Layouts: `0x01` RX/RY bytes 3-4, `0x31` (DualSense BT) 4-5 + CRC32 at 74, `0x11` (DS4 BT) 5-6 + CRC32 at 74 (CRC
+    of 0xA1 + bytes 0..73). Reports whose CRC doesn't verify are left alone. The layout counts as checked when the
+    report's right stick agrees with SDL's (byte*257-32768, tolerance 48) in >= 15 deflected frames (and >= 4x the
+    misses); 30+ misses dominating -> never suppressed for that pad. Only then `GL_HOST_NATIVE_STICK_SUPPRESSION`
+    is declared (host: `xinput_shown || native`), and while GyroLib asks, RX/RY in the game's copy become 128.
+  - **Pacific Drive, first test (DualSense USB, `XInput=1`, `NativeFlickStick=1`): flick works, but the stick still
+    turned the camera too** (holding it up pitched the camera up while the flick rotated). Log: libScePad opens
+    `054C:0CE6` (opens, closes, reopens 0.5 s later), reads overlapped, done at once, **640 bytes per read = ten 64-byte
+    USB reports**; only the first was centred, so the other nine still carried the stick. Layout check passed (15/15),
+    suppression on, 28156 reads changed. Fix: the device's `InputReportByteLength` (`HidP_GetCaps` on the game's
+    handle, fallback 64/78 by report ID) splits each read, and every report in it is centred.
+  - Pacific Drive, second test (same setup): `64-byte input reports`, reads of 768 bytes (12 reports), every report
+    centred (~490/s, matching the pad's USB rate), 15/15 layout check; suppression follows GyroLib (centred on foot
+    and in the car, passed through in pause and main menu).
+  - **Cronos (Sony's library linked into the exe, DualSense USB, `XInput=1`): works (user).** Same read pattern as
+    `libScePad.dll`: opens `054C:0CE6` (closes and reopens at once, same handle value), overlapped reads of 640 bytes
+    (10 x 64), 15/15 layout check, suppression on/off with gameplay and menus; the game closed the pad on exit and
+    suppression was withdrawn.
+  - Still to verify: Bluetooth (reports `0x31` + CRC), DualShock 4, a game with the separate DLL over Bluetooth.
+
 ## Status summary (2026-10-08)
 - Pacific Drive: **done** (on foot + car profile, in-game panel, calibration). Install:
   `games/PacificDrive/deploy-gyroue.sh "<Win64 dir>"`; uninstall with `remove`. UE4SS is parked as `dwmapi.dll.off`.
@@ -877,6 +1141,9 @@ UE4SS C++ mod built on GyroLib and no per-game code in the common case. Design b
   GUObjectArray. Install with `PROXY=version.dll bash tools/deploy-gyroue.sh "<...>\Binaries\WinGDK"`.
 
 ## Ideas for later
+- XInput translation extras (0.7.0 is alpha with the default mapping): split touchpad (left half View, right half
+  Menu, via `SDL_GetGamepadTouchpadFinger`), extra buttons (Edge paddles, mic, Capture) copying a standard button
+  from the ini. Not keyboard keys: UE would switch to keyboard/mouse prompts.
 
 - **Auto-probe with closed-loop check** (discussed 2026-10-09, parked): find the camera's real rotation state without a
   manual probe. Candidates = float/double rotators in objects reachable from Pawn/PC/Camera that equal the POV; drop

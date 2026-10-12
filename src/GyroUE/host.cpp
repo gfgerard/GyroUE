@@ -2,10 +2,12 @@
 
 #include "deps.hpp"
 #include "log.hpp"
+#include "nativepad.hpp"
 #include "notify.hpp"
 #include "overlay.hpp"
 #include "perf.hpp"
 #include "ue.hpp"
+#include "xinput.hpp"
 
 #include <windows.h>
 
@@ -79,6 +81,7 @@ FILETIME g_ini_time{};
 uint32_t g_last_view = UINT32_MAX;
 double g_applied_yaw = 0, g_applied_pitch = 0;
 bool g_applied_this_frame = false;
+bool g_stick_suppression = false;  // GL_HOST_NATIVE_STICK_SUPPRESSION declared (xinput.cpp or nativepad.cpp can do it)
 
 // Motion delivery, for the status line. Samples and distinct arrival times come from GyroLib's sample observer; the
 // camera updates count how often the gyro turned the camera, and how often it did so without a new sample. The Switch
@@ -228,7 +231,23 @@ const char kDefaultSettings[] =
     ";     Set it back to 0 once the camera works. Results: GyroUE\\GyroUE-probe.log.\r\n"
     "Probe=0\r\n"
     "; 0 = no on-screen notices (they still go to GyroUE.log).\r\n"
-    "Notices=1\r\n";
+    "Notices=1\r\n"
+    "\r\n"
+    "; Show a non-Xbox controller (DualSense, Switch Pro, DirectInput pads) to the game as an Xbox (XInput) controller, for\r\n"
+    "; games that only support Xbox controllers without Steam Input. 0 = off, 1 = auto (only when the game doesn't read\r\n"
+    ";     the controller itself and no Xbox/Steam Input/DS4Windows controller is present), 2 = always (unless the\r\n"
+    ";     controller already is an Xbox one). Restart the game after changing it.\r\n"
+    "XInput=1\r\n"
+    "; Face buttons: 0 = by position (bottom = Xbox A), 1 = swap A<->B and X<->Y (Nintendo A = Xbox A; any controller).\r\n"
+    "XInputNintendoLabels=0\r\n"
+    "; 1 = the DualSense touchpad click also presses View (Back), like the Create button. 0 = the game ignores it.\r\n"
+    "XInputTouchpadBack=1\r\n"
+    "\r\n"
+    "; 1 = GyroLib's flick stick (F10 panel) also in games with their own PlayStation controller support: GyroUE centres\r\n"
+    ";     the right stick in what the game reads while flick stick is on, keeping PlayStation icons, haptics and\r\n"
+    ";     adaptive triggers. Offered after you move the right stick once in game. Needs XInput=1 (with XInput=2 the\r\n"
+    ";     game doesn't read the controller itself; flick stick then works through the Xbox controller). 0 = off.\r\n"
+    "NativeFlickStick=0\r\n";
 
 void ensure_settings_file() {
     if (GetFileAttributesW(g_settings_path.c_str()) != INVALID_FILE_ATTRIBUTES) return;
@@ -380,6 +399,8 @@ struct Scene {
     bool paused = false, cursor = false;
     bool pov_ok = false;  // the camera's final rotation (PlayerCameraManager POV) was read
     double pov_pitch = 0, pov_yaw = 0;
+    bool loc_ok = false;  // ... and its location (probe only)
+    double pov_loc[3] = {};
 };
 
 Scene read_scene() {
@@ -412,6 +433,7 @@ Scene read_scene() {
     const ue::Obj camera = ue::read_obj(s.pc, "PlayerCameraManager");
     s.camera = camera;
     s.pov_ok = (g_need_pov || g_probe) && ue::camera_pov(camera, s.pov_pitch, s.pov_yaw);
+    s.loc_ok = g_probe && s.pov_ok && ue::camera_pov_location(camera, s.pov_loc);
     const ue::Prop view_target = ue::prop_of(camera, "ViewTarget");
     const ue::Prop target = ue::find_prop(ue::struct_type(view_target), "Target");
     if (view_target && target) ue::read_ptr(camera + view_target.offset + target.offset, s.view_target);
@@ -548,19 +570,19 @@ void take_snapshot(const Scene& s) {
     ue::probe_snapshot({{"PC", s.pc}, {"Pawn", s.pawn}, {"Camera", s.camera}, {"ViewTarget", s.view_target}});
 }
 
-// Writes the probe's result once there are two scored captures: the game's profile itself if the game had none
-// when it started (and the same file again on later captures), otherwise <exe>.suggested.ini next to it. A result
-// with no usable view never becomes the profile. Returns where it went (empty = nothing written yet).
+// Writes the probe's result: the game's profile itself only when the live test verified it and the game had no
+// profile when it started (or the probe created it this session); otherwise <exe>.suggested.ini next to it. An
+// unverified guess never becomes the profile. Returns where it went (Nothing = no result yet).
 enum class Written { Nothing, Profile, Suggested };
 
-Written write_suggestion(bool& usable) {
-    usable = false;
+Written write_suggestion(bool& usable, bool& verified) {
+    usable = verified = false;
     std::string summary;
-    const std::string probe = ue::probe_suggestion(narrow(g_exe_stem), summary, false);
+    const std::string probe = ue::probe_suggestion(narrow(g_exe_stem), summary, false, verified);
     if (probe.empty()) return Written::Nothing;
     usable = probe.find("[View.Default]") != std::string::npos;
-    const bool as_profile = usable && (!g_profile_existed || g_profile_created);
-    const std::string text = as_profile ? ue::probe_suggestion(narrow(g_exe_stem), summary, true) : probe;
+    const bool as_profile = usable && verified && (!g_profile_existed || g_profile_created);
+    const std::string text = as_profile ? ue::probe_suggestion(narrow(g_exe_stem), summary, true, verified) : probe;
     const std::wstring path = g_mod_dir + L"\\profiles\\" + g_exe_stem + (as_profile ? L".ini" : L".suggested.ini");
     FILE* file = nullptr;
     if (_wfopen_s(&file, path.c_str(), L"wb") != 0) file = nullptr;
@@ -575,41 +597,76 @@ Written write_suggestion(bool& usable) {
     return as_profile ? Written::Profile : Written::Suggested;
 }
 
-// On-screen progress after a scored capture.
-void notify_capture(int capture) {
-    bool usable = false;
-    const Written written = write_suggestion(usable);
-    std::wstring text = capture > 0 ? L"GyroUE probe: capture " + std::to_wstring(capture) + L" done.\n"
-                                    : std::wstring(L"GyroUE probe: diff done.\n");
+// On-screen result of a manual diff (F8): no live test there, so only an unverified suggestion is written.
+void notify_manual_diff() {
+    bool usable = false, verified = false;
+    const Written written = write_suggestion(usable, verified);
+    std::wstring text = L"GyroUE probe: diff done.\n";
     if (written == Written::Nothing)
-        text += L"Turn the camera again with the right stick (more than 30\u00B0), then stop.";
-    else if (written == Written::Profile)
-        text += L"Game profile created: GyroUE\\profiles\\" + g_exe_stem + L".ini\n"
-                L"Restart the game to use it, then set Probe=0 in GyroUE\\GyroUE.ini. More turns make it more reliable.";
+        text += L"Turn the camera with the right stick, then F7/F8 again (two diffs are needed).";
     else if (usable)
-        text += L"This game already has a profile, so the result went to GyroUE\\profiles\\" + g_exe_stem +
-                L".suggested.ini\nTo use it, rename it to " + g_exe_stem + L".ini (replacing the old one) and restart.";
+        text += L"Unverified guess written to GyroUE\\profiles\\" + g_exe_stem +
+                L".suggested.ini\nFor a verified profile, use the automatic probe (Probe=1 without F7/F8).";
     else
-        text += L"No camera rotation found yet. Keep turning with the right stick (see GyroUE-probe.log).";
+        text += L"No camera rotation found yet (see GyroUE-probe.log).";
     notify::show(text, written == Written::Nothing ? 10 : 20);
 }
 
-// Automatic capture (Probe=1): a snapshot once the camera rests, a scored diff when the player has turned it
-// more than 30 degrees with the stick and stopped again. Off as soon as F7/F8 are used.
+// Automatic probe (Probe=1), guided by on-screen notices:
+// 1. Captures: a snapshot once the camera rests, a scored diff when the player has turned it more than 30 degrees
+//    with the right stick and stopped again. Every rotation that followed the camera becomes a candidate.
+// 2. Live test, after kCapturesForTest captures, while the player doesn't touch the controller: each candidate
+//    gets small turns written into it, exactly as a profile would write them. It passes only if the camera turns by
+//    that amount and comes back when the turn is undone, and again in a second round. An output (the game rewrites
+//    it every frame) or a copy the camera doesn't read fails, which is what the captures alone can't tell apart.
+// 3. A verified rotation becomes the game's profile (or <exe>.suggested.ini). Without one: more captures, then the
+//    new candidates are tested; after kMaxAutoCaptures only an unverified guess is written, never as the profile.
+// Off as soon as F7/F8 are used.
 struct AutoProbe {
     bool enabled = true, armed = false, announced = false, have_last = false;
+    bool done = false;            // finished: verified, or out of captures
     bool stick_turn = false;      // the right stick was deflected since the snapshot
     bool stick_data = false;      // GyroLib has reported the right stick at least once (else no stick filter)
     double snap_pitch = 0, snap_yaw = 0, last_pitch = 0, last_yaw = 0;
     ue::Obj pawn = 0;
+    ue::Obj target_class = 0;     // view target class of the captures: the live test runs on the same camera
     ULONGLONG still_since = 0, snapshot_at = 0, next_snapshot = 0;
     int captures = 0;
+    // How far the camera moves when the stick turns it: a third-person camera orbits around the character (its
+    // location moves on a circle of this radius), a first-person one turns on the spot (radius about 0). Measured
+    // in every capture; the live test checks that a candidate's turn moves the camera the same way.
+    bool snap_loc_ok = false;
+    double snap_loc[3] = {};
+    std::vector<double> radii;
 } g_auto;
-constexpr int kMaxAutoCaptures = 8;
+constexpr int kMaxAutoCaptures = 8, kCapturesForTest = 3, kMaxTests = 40;
+constexpr double kTestTurn = 3.0, kTestTolerance = 0.5;
+constexpr double kOrbitMin = 30;  // world units: below this the camera turns on the spot (first person), no orbit check
+constexpr double kDegToRad = 3.14159265358979323846 / 180;
 
-// While the automatic capture runs, the gyro output is paused: a turn must come from the right stick alone, and the
+// Angle in degrees between the view directions of two rotations.
+double view_angle(double p0, double y0, double p1, double y1) {
+    const double r = kDegToRad;
+    const double a[3] = {std::cos(p0 * r) * std::cos(y0 * r), std::cos(p0 * r) * std::sin(y0 * r), std::sin(p0 * r)};
+    const double b[3] = {std::cos(p1 * r) * std::cos(y1 * r), std::cos(p1 * r) * std::sin(y1 * r), std::sin(p1 * r)};
+    return std::acos(std::clamp(a[0] * b[0] + a[1] * b[1] + a[2] * b[2], -1.0, 1.0)) / r;
+}
+
+double distance(const double a[3], const double b[3]) {
+    return std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
+}
+
+// The camera's orbit radius from the captures (median), 0 if unknown.
+double orbit_radius() {
+    if (g_auto.radii.empty()) return 0;
+    std::vector<double> r = g_auto.radii;
+    std::sort(r.begin(), r.end());
+    return r[r.size() / 2];
+}
+
+// While the automatic probe runs, the gyro output is paused: a turn must come from the right stick alone, and the
 // gyro written into a rotation the camera ignores (or a resting controller's drift) would only spoil it.
-bool probe_capturing() { return g_probe && g_auto.enabled && g_auto.captures < kMaxAutoCaptures; }
+bool probe_capturing() { return g_probe && g_auto.enabled && !g_auto.done; }
 
 // The right stick is deflected (GyroLib's view of the selected controller, SDL or a bound companion).
 bool right_stick_moving() {
@@ -619,19 +676,312 @@ bool right_stick_moving() {
     return std::hypot(fi.stick_x, fi.stick_y) > 0.3f;
 }
 
-void auto_probe(const Scene& s) {
-    const ULONGLONG now = GetTickCount64();
-    if (!g_auto.enabled || g_auto.captures >= kMaxAutoCaptures || !s.pov_ok || !s.pawn || s.paused || s.cursor ||
-        !game_has_focus()) {
-        g_auto.armed = g_auto.have_last = false;
+struct LiveTest {
+    enum Phase { Off, Settle, Null, YawOut, YawBack, PitchOut, PitchBack } phase = Off;
+    std::vector<ue::ProbeGroup> queue;
+    size_t index = 0;
+    int round = 1, attempts = 0;
+    std::vector<std::string> passed;  // ids that moved the camera in round 1 (tested again in round 2)
+    View view;                        // the candidate, as a profile view
+    double base_p = 0, base_y = 0;    // camera before the current turn
+    double val_y = 0, pawn_yaw = 0, delta_p = 0;
+    double written_p = 0, written_y = 0;  // turn currently written into the candidate (undone on abort)
+    bool base_loc_ok = false;
+    double base_loc[3] = {};
+    std::string orbit_note;
+    bool yaw_ok = false, pitch_ok = false, turns_pawn = false;
+    ULONGLONG phase_at = 0, ok_since = 0, last_pause_notice = 0;
+} g_test;
+
+View test_view(const ue::ProbeGroup& g) {
+    View v;
+    v.label = "probe test";
+    v.object = split(g.object, '.');
+    v.property = g.property;
+    v.offsets = g.offsets;
+    v.rotator_size = g.size ? g.size : 24;
+    v.world_rotation = g.world;
+    return v;
+}
+
+// The candidate's current rotation (its first rotator for raw groups).
+bool read_view_rotation(const View& v, const Scene& s, double& pitch, double& yaw) {
+    const ue::Obj target = view_object(v, s);
+    if (!target) return false;
+    double roll = 0;
+    if (!v.offsets.empty()) return ue::read_rotator(target + v.offsets.front(), v.rotator_size, pitch, yaw, roll);
+    const ue::Prop p = ue::prop_of(target, v.property.empty() ? "ControlRotation" : v.property.c_str());
+    return p && ue::read_rotator(target + p.offset, p.element_size, pitch, yaw, roll);
+}
+
+// The pawn's own rotation (root component), NaN if unknown: a candidate that turns the character is noted.
+double pawn_yaw(const Scene& s) {
+    const ue::Obj root = ue::read_obj(s.pawn, "RootComponent");
+    const ue::Prop p = ue::prop_of(root, "RelativeRotation");
+    double pitch = 0, yaw = 0, roll = 0;
+    return p && ue::read_rotator(root + p.offset, p.element_size, pitch, yaw, roll) ? yaw : std::nan("");
+}
+
+std::string group_text(const ue::ProbeGroup& g) {
+    std::string s = g.object;
+    if (!g.property.empty()) return s + "." + g.property;
+    s += " raw";
+    for (size_t i = 0; i < g.offsets.size(); ++i) s += std::format("{}0x{:X}", i ? "," : " ", g.offsets[i]);
+    return s;
+}
+
+void finish_tests();
+
+void next_candidate() {
+    ++g_test.index;
+    g_test.attempts = 0;
+    g_test.phase = LiveTest::Settle;  // a turn still written (undo failed) is undone there, before the next test
+    if (g_test.index < g_test.queue.size()) {
+        notify::show(std::format(L"GyroUE probe: testing rotation {} of {}{}.\nDON'T TOUCH THE CONTROLLER (the camera "
+                                 L"twitches a little).",
+                                 g_test.index + 1, g_test.queue.size(), g_test.round == 2 ? L" (second round)" : L""),
+                     8);
         return;
     }
-    const double motion = g_auto.have_last ? std::abs(wrap180(s.pov_yaw - g_auto.last_yaw)) +
-                                                 std::abs(s.pov_pitch - g_auto.last_pitch)
-                                           : 1;
-    if (motion > 0.05 || !g_auto.have_last) g_auto.still_since = now;
-    g_auto.last_pitch = s.pov_pitch, g_auto.last_yaw = s.pov_yaw, g_auto.have_last = true;
-    const ULONGLONG still_for = now - g_auto.still_since;
+    if (g_test.round == 1 && !g_test.passed.empty()) {  // round 2: the ones that moved the camera, once more
+        std::vector<ue::ProbeGroup> again;
+        for (const ue::ProbeGroup& g : ue::probe_groups())
+            if (std::find(g_test.passed.begin(), g_test.passed.end(), g.id) != g_test.passed.end()) again.push_back(g);
+        g_test.queue = std::move(again);
+        g_test.index = 0;
+        g_test.round = 2;
+        probe_log("probe test: second round, %zu rotation(s)", g_test.queue.size());
+        if (!g_test.queue.empty()) {
+            notify::show(std::format(L"GyroUE probe: second round, rotation 1 of {}.\nDON'T TOUCH THE CONTROLLER.",
+                                     g_test.queue.size()),
+                         8);
+            return;
+        }
+    }
+    finish_tests();
+}
+
+void test_result(int verdict, const std::string& note) {
+    const ue::ProbeGroup& g = g_test.queue[g_test.index];
+    const char* what = verdict == ue::kMovesCamera ? "MOVES THE CAMERA" : verdict == ue::kOverwritten ? "overwritten (output)"
+                     : verdict == ue::kNoEffect    ? "kept, camera didn't move"
+                     : verdict == ue::kInconsistent ? "inconsistent"
+                     : verdict == ue::kTurnsInPlace ? "turned the view in place (no orbit)" : "not testable";
+    probe_log("probe test (round %d): %s: %s%s%s", g_test.round, group_text(g).c_str(), what, note.empty() ? "" : ": ",
+              note.c_str());
+    log("probe test (round %d): %s: %s%s%s", g_test.round, group_text(g).c_str(), what, note.empty() ? "" : ": ", note.c_str());
+    if (verdict == ue::kMovesCamera && g_test.round == 1) g_test.passed.push_back(g.id);  // verdict after round 2
+    else if (verdict != ue::kMovesCamera && g_test.round == 2) ue::probe_verdict(g.id, ue::kInconsistent, note);
+    else ue::probe_verdict(g.id, verdict, note);
+    next_candidate();
+}
+
+// Undo whatever turn is written into the candidate. If it can't be written now (left gameplay), it stays pending
+// and Settle retries it before anything else.
+bool undo_turn(const Scene& s) {
+    if (g_test.written_p == 0 && g_test.written_y == 0) return true;
+    if (!apply(g_test.view, s, -g_test.written_p, -g_test.written_y)) return false;
+    g_test.written_p = g_test.written_y = 0;
+    return true;
+}
+
+void abort_test(const Scene& s, const char* why) {
+    undo_turn(s);
+    g_test.phase = LiveTest::Settle;
+    if (++g_test.attempts > 3) {
+        test_result(ue::kUntestable, std::string("interrupted 3 times (") + why + ")");
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_test.last_pause_notice > 4000) {
+        g_test.last_pause_notice = now;
+        notify::show(L"GyroUE probe: test paused. Stay in game and DON'T TOUCH THE CONTROLLER.", 5);
+    }
+}
+
+bool start_tests() {
+    std::vector<ue::ProbeGroup> queue;
+    for (const ue::ProbeGroup& g : ue::probe_groups())
+        if (g.verdict == ue::kUntested && queue.size() < size_t(kMaxTests)) queue.push_back(g);
+    if (queue.empty() || g_test.written_p != 0 || g_test.written_y != 0) return false;
+    const ULONGLONG keep_notice = g_test.last_pause_notice;
+    g_test = {};
+    g_test.last_pause_notice = keep_notice;
+    g_test.queue = std::move(queue);
+    g_test.phase = LiveTest::Settle;
+    g_auto.armed = false;
+    probe_log("probe test: %zu rotation(s) to test after %d captures", g_test.queue.size(), g_auto.captures);
+    log("probe: live test of %zu rotation(s) that followed the camera (the player must not touch the controller)",
+        g_test.queue.size());
+    notify::show(std::format(L"GyroUE probe: {} captures done. Now testing {} rotation(s) live.\n"
+                             L"Stay in game and DON'T TOUCH THE CONTROLLER: the camera will twitch a little.",
+                             g_auto.captures, g_test.queue.size()),
+                 10);
+    return true;
+}
+
+void finish_tests() {
+    g_test.phase = LiveTest::Off;
+    bool usable = false, verified = false;
+    const Written written = write_suggestion(usable, verified);
+    const std::wstring file = L"GyroUE\\profiles\\" + g_exe_stem + (written == Written::Profile ? L".ini" : L".suggested.ini");
+    if (verified) {
+        g_auto.done = true;
+        log("probe: done, a rotation moved the camera in both rounds of the live test");
+        notify::show(written == Written::Profile
+                         ? L"GyroUE probe: camera found and VERIFIED live.\nProfile created: " + file +
+                               L"\nRestart the game to use it, then set Probe=0 in GyroUE\\GyroUE.ini."
+                         : L"GyroUE probe: camera found and VERIFIED live.\nThis game already has a profile, so it went to " +
+                               file + L"\nRename it to " + g_exe_stem + L".ini (replacing the old one) and restart.",
+                     30);
+        return;
+    }
+    if (g_auto.captures >= kMaxAutoCaptures) {
+        g_auto.done = true;
+        log("probe: done, no rotation moved the camera in the live test");
+        notify::show(L"GyroUE probe: no rotation moved the camera, so no profile was created.\n" +
+                         (usable ? L"An unverified guess is in " + file + L" (it will probably not work).\n" : std::wstring()) +
+                         L"See GyroUE\\GyroUE-probe.log. The gyro works again (default camera).",
+                     30);
+        return;
+    }
+    notify::show(L"GyroUE probe: none of these rotations moved the camera.\nTurn the camera again with the RIGHT "
+                 L"STICK (more than 30°), then stop, to find more.",
+                 15);
+}
+
+// One frame of the live test. valid: in game, unpaused, no cursor, focused (the same rules as the captures).
+void run_live_test(const Scene& s, bool valid, ULONGLONG still_for) {
+    const ULONGLONG now = GetTickCount64();
+    const bool writing = g_test.phase != LiveTest::Settle && g_test.phase != LiveTest::Null;
+    if (!valid || !s.pov_ok || ue::class_of(s.view_target) != g_auto.target_class || right_stick_moving()) {
+        if (writing || g_test.phase == LiveTest::Null)
+            abort_test(s, !valid ? "left gameplay" : !s.pov_ok ? "no camera" : ue::class_of(s.view_target) != g_auto.target_class
+                                                                                  ? "another camera" : "stick moved");
+        return;
+    }
+    const double dy = wrap180(s.pov_yaw - g_test.base_y), dp = s.pov_pitch - g_test.base_p;
+    // A condition held for `ms` (the camera may ease into a written turn).
+    auto held = [&](bool on, ULONGLONG ms) {
+        if (!on) return g_test.ok_since = 0, false;
+        if (!g_test.ok_since) g_test.ok_since = now;
+        return now - g_test.ok_since >= ms;
+    };
+    auto enter = [&](LiveTest::Phase p) {
+        g_test.phase = p;
+        g_test.phase_at = now;
+        g_test.ok_since = 0;
+    };
+    const ULONGLONG in_phase = now - g_test.phase_at;
+    switch (g_test.phase) {
+    case LiveTest::Off:
+        return;
+    case LiveTest::Settle:  // the camera rests
+        if (!undo_turn(s)) return;
+        if (still_for < 600) return;
+        g_test.base_p = s.pov_pitch, g_test.base_y = s.pov_yaw;
+        enter(LiveTest::Null);
+        return;
+    case LiveTest::Null: {  // and keeps resting without our writes (no drift, no idle animation turning it)
+        if (std::abs(dy) > 0.2 || std::abs(dp) > 0.2) {
+            enter(LiveTest::Settle);
+            return;
+        }
+        if (in_phase < 250) return;
+        const ue::ProbeGroup& g = g_test.queue[g_test.index];
+        if (g.property.find('.') != std::string::npos) return test_result(ue::kUntestable, "nested in a struct");
+        g_test.view = test_view(g);
+        double p0 = 0;
+        if (!read_view_rotation(g_test.view, s, p0, g_test.val_y))
+            return test_result(ue::kUntestable, "its object path doesn't resolve now");
+        g_test.pawn_yaw = pawn_yaw(s);
+        g_test.yaw_ok = g_test.pitch_ok = g_test.turns_pawn = false;
+        g_test.base_loc_ok = s.loc_ok;
+        if (s.loc_ok) std::copy(s.pov_loc, s.pov_loc + 3, g_test.base_loc);
+        if (!apply(g_test.view, s, 0, kTestTurn)) return test_result(ue::kUntestable, "couldn't be written");
+        g_test.written_y = kTestTurn;
+        enter(LiveTest::YawOut);
+        return;
+    }
+    case LiveTest::YawOut: {  // the camera turns by the written yaw, and stays there
+        const bool on = std::abs(dy - kTestTurn) < kTestTolerance && std::abs(dp) < kTestTolerance;
+        if (held(on, 150)) g_test.yaw_ok = true;
+        else if (in_phase < 700) return;
+        double p = 0, y = 0;
+        const bool kept = read_view_rotation(g_test.view, s, p, y) && std::abs(wrap180(y - g_test.val_y - kTestTurn)) < kTestTolerance;
+        const double pawn_now = pawn_yaw(s);
+        g_test.turns_pawn = std::isfinite(pawn_now) && std::isfinite(g_test.pawn_yaw) &&
+                            std::abs(wrap180(pawn_now - g_test.pawn_yaw - kTestTurn)) < kTestTolerance;
+        // Third-person camera: the stick orbits it around the character, so its location moves; a candidate that
+        // only turns the view on the spot (a free camera) is not the look input.
+        const double radius = orbit_radius();
+        g_test.orbit_note.clear();
+        if (g_test.yaw_ok && radius >= kOrbitMin && g_test.base_loc_ok && s.loc_ok) {
+            const double angle = view_angle(g_test.base_p, g_test.base_y, s.pov_pitch, s.pov_yaw);
+            const double expected = 2 * radius * std::sin(angle * kDegToRad / 2);
+            const double moved = distance(g_test.base_loc, s.pov_loc);
+            g_test.orbit_note = std::format("camera moved {:.1f} for an expected {:.1f} (orbit radius {:.0f})", moved,
+                                            expected, radius);
+            if (moved < expected * 0.4) {
+                undo_turn(s);
+                return test_result(ue::kTurnsInPlace, g_test.orbit_note);
+            }
+        }
+        undo_turn(s);
+        if (!g_test.yaw_ok)
+            return test_result(kept ? ue::kNoEffect : ue::kOverwritten,
+                               kept ? "the value kept the turn, the camera didn't follow" : "the game rewrote the value");
+        enter(LiveTest::YawBack);
+        return;
+    }
+    case LiveTest::YawBack:  // undoing it brings the camera back
+        if (held(std::abs(dy) < kTestTolerance && std::abs(dp) < kTestTolerance, 100)) {
+            g_test.base_p = s.pov_pitch, g_test.base_y = s.pov_yaw;
+            g_test.delta_p = g_test.base_p > 0 ? -kTestTurn : kTestTurn;  // towards level: away from the pitch limits
+            if (!apply(g_test.view, s, g_test.delta_p, 0)) return test_result(ue::kUntestable, "pitch couldn't be written");
+            g_test.written_p = g_test.delta_p;
+            enter(LiveTest::PitchOut);
+            return;
+        }
+        if (in_phase >= 700) return test_result(ue::kInconsistent, "the camera turned but didn't come back when undone");
+        return;
+    case LiveTest::PitchOut: {
+        const bool on = std::abs(dp - g_test.delta_p) < kTestTolerance && std::abs(dy) < kTestTolerance;
+        if (held(on, 150)) g_test.pitch_ok = true;
+        else if (in_phase < 700) return;
+        undo_turn(s);
+        enter(LiveTest::PitchBack);
+        return;
+    }
+    case LiveTest::PitchBack:
+        if (!held(std::abs(dy) < kTestTolerance && std::abs(dp) < kTestTolerance, 100) && in_phase < 700) return;
+        test_result(ue::kMovesCamera, std::string("yaw followed") +
+                                          (g_test.pitch_ok ? ", pitch followed" : ", pitch didn't move (may be kept elsewhere)") +
+                                          (g_test.turns_pawn ? ", it also turns the character" : "") +
+                                          (g_test.orbit_note.empty() ? "" : ", " + g_test.orbit_note));
+        return;
+    }
+}
+
+void auto_probe(const Scene& s) {
+    if (!g_auto.enabled || g_auto.done) return;
+    const ULONGLONG now = GetTickCount64();
+    const bool valid = s.pov_ok && s.pawn && !s.paused && !s.cursor && game_has_focus();
+    if (valid) {
+        const double motion = g_auto.have_last ? std::abs(wrap180(s.pov_yaw - g_auto.last_yaw)) +
+                                                     std::abs(s.pov_pitch - g_auto.last_pitch)
+                                               : 1;
+        if (motion > 0.05 || !g_auto.have_last) g_auto.still_since = now;
+        g_auto.last_pitch = s.pov_pitch, g_auto.last_yaw = s.pov_yaw, g_auto.have_last = true;
+    } else {
+        g_auto.have_last = false;
+    }
+    const ULONGLONG still_for = valid ? now - g_auto.still_since : 0;
+    if (g_test.phase != LiveTest::Off) return run_live_test(s, valid, still_for);
+    if (!valid || g_auto.captures >= kMaxAutoCaptures) {
+        g_auto.armed = false;
+        return;
+    }
 
     if (g_auto.armed) {
         if (right_stick_moving()) g_auto.stick_turn = true;
@@ -650,27 +1000,50 @@ void auto_probe(const Scene& s) {
         }
         ++g_auto.captures;
         probe_log("probe: automatic capture %d: the camera turned %.0f degrees sideways and %.0f up/down", g_auto.captures, dy, dp);
-        if (ue::probe_diff(false) > 0)
-            notify_capture(g_auto.captures);
-        else
+        if (ue::probe_diff(false) == 0) {
             notify::show(L"GyroUE probe: capture " + std::to_wstring(g_auto.captures) +
                          L" could not be compared (see GyroUE-probe.log).\nKeep turning with the right stick.");
-        if (g_auto.captures >= kMaxAutoCaptures) log("probe: %d automatic captures done, automatic capture off", g_auto.captures);
+            return;
+        }
+        g_auto.target_class = ue::class_of(s.view_target);
+        if (g_auto.snap_loc_ok && s.loc_ok) {
+            const double angle = view_angle(g_auto.snap_pitch, g_auto.snap_yaw, s.pov_pitch, s.pov_yaw);
+            const double chord = distance(g_auto.snap_loc, s.pov_loc);
+            const double radius = chord / (2 * std::sin(angle * kDegToRad / 2));
+            g_auto.radii.push_back(radius);
+            probe_log("probe: the camera moved %.1f units for a %.0f degree turn: orbit radius %.0f (%s)", chord, angle, radius,
+                      radius >= kOrbitMin ? "third person, orbits the character" : "turns on the spot");
+        }
+        if (g_auto.captures >= kCapturesForTest && start_tests()) return;
+        if (g_auto.captures >= kMaxAutoCaptures) return finish_tests();
+        notify::show(g_auto.captures < kCapturesForTest
+                         ? std::format(L"GyroUE probe: capture {} of {} done.\nTurn the camera again with the RIGHT STICK "
+                                       L"(more than 30°, also up or down), then stop.",
+                                       g_auto.captures, kCapturesForTest)
+                         : std::format(L"GyroUE probe: capture {} done, no new rotation to test yet.\nTurn the camera again "
+                                       L"with the RIGHT STICK (more than 30°), then stop.",
+                                       g_auto.captures),
+                     10);
         return;
     }
     if (still_for >= 500 && now >= g_auto.next_snapshot) {
         take_snapshot(s);
         g_auto.armed = true;
         g_auto.snap_pitch = s.pov_pitch, g_auto.snap_yaw = s.pov_yaw;
+        g_auto.snap_loc_ok = s.loc_ok;
+        if (s.loc_ok) std::copy(s.pov_loc, s.pov_loc + 3, g_auto.snap_loc);
         g_auto.stick_turn = false;
         g_auto.pawn = s.pawn;
         g_auto.snapshot_at = now;
         if (!g_auto.announced) {
             g_auto.announced = true;
             log("probe: automatic capture ready: turn the camera with the RIGHT STICK (more than 30 degrees), stop, "
-                "and repeat 3-4 times; the gyro is paused until the captures are done");
-            notify::show(L"GyroUE probe ready to find cameras. In game, turn the camera with "
-                         L"the RIGHT STICK (more than 30°), then stop. Repeat 3-4 times.", 30);
+                "and repeat; after %d captures the rotations found are tested live; the gyro is paused meanwhile",
+                kCapturesForTest);
+            notify::show(L"GyroUE probe ready to find the camera. In game, turn the camera with the RIGHT STICK "
+                         L"(more than 30°), then stop. Repeat 3 times.\nThen don't touch the controller while "
+                         L"the probe tests what it found.",
+                         30);
         }
     }
 }
@@ -681,24 +1054,46 @@ void probe_keys(const Scene& s) {
     const bool diff = focused && (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if ((snap || diff) && g_auto.enabled) {
         g_auto.enabled = g_auto.armed = false;
-        log("probe: F7/F8 used, automatic capture off for this session");
+        undo_turn(s);
+        g_test.phase = LiveTest::Off;
+        log("probe: F7/F8 used, automatic probe (captures and live test) off for this session");
     }
     if (snap && !g_probe_snap_down) take_snapshot(s);
-    if (diff && !g_probe_diff_down && ue::probe_diff(true) > 0) notify_capture(0);
+    if (diff && !g_probe_diff_down && ue::probe_diff(true) > 0) notify_manual_diff();
     g_probe_snap_down = snap;
     g_probe_diff_down = diff;
 }
 
 // Step 1 of finding a camera: tells the user when the gyro turns the view's rotation but the camera doesn't
 // follow (the game ignores ControlRotation, or the profile's rotation), or confirms that it does. Only on the
-// player's own camera: scripted or fixed cameras (another view target) ignore every rotation by design.
+// player's own camera (see player_camera): scripted or fixed cameras ignore every rotation by design.
 struct FollowCheck {
     double applied = 0, moved = 0, last_pitch = 0, last_yaw = 0, total_applied = 0, total_moved = 0;
     bool have_last = false, warned = false, confirmed = false;
     int ignored = 0, followed = 0;  // 2 s windows with enough gyro motion where the camera ignored / followed it
     bool stick = false;             // the right stick moved in this window: the camera motion can't be judged
     ULONGLONG window_end = 0;
+    // Some games' gameplay camera is its own actor, not the pawn (Hogwarts Legacy: BP_ThirdPersonCameraStackActor_C).
+    // A view target class whose camera turned 30+ degrees while the right stick was held is the player's camera.
+    ue::Obj stick_class = 0;        // view target class being measured
+    double stick_moved = 0;         // camera rotation seen with the stick held, for stick_class
+    std::vector<ue::Obj> player_cameras;
 } g_follow;
+
+// The view target is the player's own camera: the pawn, or a camera actor that follows the right stick.
+bool player_camera(const Scene& s, double moved) {
+    if (s.view_target == s.pawn) return true;
+    const ue::Obj cls = ue::class_of(s.view_target);
+    if (!cls) return false;
+    if (std::find(g_follow.player_cameras.begin(), g_follow.player_cameras.end(), cls) != g_follow.player_cameras.end())
+        return true;
+    if (cls != g_follow.stick_class) g_follow.stick_class = cls, g_follow.stick_moved = 0;
+    if (right_stick_moving()) g_follow.stick_moved += moved;
+    if (g_follow.stick_moved < 30) return false;
+    g_follow.player_cameras.push_back(cls);
+    log("camera: view target %s turns with the right stick: treated as the player's camera", ue::name_of(cls).c_str());
+    return true;
+}
 
 void follow_check(const Scene& s, const View* view, double gyro_deg) {
     if (g_follow.warned || g_follow.confirmed) return;  // verdict given: off for the session
@@ -710,8 +1105,9 @@ void follow_check(const Scene& s, const View* view, double gyro_deg) {
                                                   std::abs(s.pov_pitch - g_follow.last_pitch)
                                             : 0;
     g_follow.last_pitch = s.pov_pitch, g_follow.last_yaw = s.pov_yaw, g_follow.have_last = true;
-    if (!view || gyro_deg <= 0 || s.paused || s.cursor || !s.pawn) return;
-    if (view->view_target_class.empty() && s.view_target != s.pawn) return;
+    if (!view || s.paused || s.cursor || !s.pawn) return;
+    if (view->view_target_class.empty() && !player_camera(s, moved)) return;
+    if (gyro_deg <= 0) return;
     g_follow.applied += gyro_deg;
     g_follow.moved += moved;
     if (right_stick_moving()) g_follow.stick = true;
@@ -797,6 +1193,19 @@ void status(const Scene& s, const View* view) {
     }
 }
 
+// The engine's reflection data can't be read (e.g. "ue: core classes not found"): nothing can turn the camera, and the
+// probe needs the same data, so say so once instead of staying silent.
+void engine_check() {
+    static ULONGLONG since = GetTickCount64();
+    static bool told = false;
+    if (told || ue::ready() || GetTickCount64() - since < 60000) return;
+    told = true;
+    log("ue: the engine's data still can't be read after 60 s: the gyro can't turn the camera in this game "
+        "(the probe needs the same data). Please report the game with this log.");
+    notify::show(L"GyroUE: this game isn't supported yet (its engine data can't be read),\n"
+                 L"so the gyro can't turn the camera. Please report it with GyroUE\\GyroUE.log.", 20);
+}
+
 void frame() {
     if (!g_gyro && !start_gyro()) {
         g_failed = true;
@@ -812,6 +1221,7 @@ void frame() {
     if (!overlay::available() && gl_panel_open(g_gyro->get())) gl_set_panel_open(g_gyro->get(), 0);
 
     const Scene s = read_scene();
+    engine_check();
     if (g_probe) probe_keys(s);
     View* view = active_view(s);
     if (view) diagnostics(*view, s);
@@ -841,6 +1251,15 @@ void frame() {
     }
     const uint64_t now_ns = SDL_GetTicksNS();
     const gl_output out = g_input->update(now_ns, host, view_id);
+    // GyroLib's flick stick needs the game's own right-stick rotation suppressed: possible for the controller shown to
+    // the game as XInput, or when the game reads the controller itself through a checked report layout.
+    SDL_Gamepad* pad = xinput::selected_gamepad(g_gyro->get(), g_input->get(), out);
+    const bool xinput_shown = xinput::frame(g_gyro->get(), g_input->get(), out);
+    const bool native = nativepad::frame(pad, out.suppress_native_right_stick != 0 && !xinput_shown);
+    if ((xinput_shown || native) != g_stick_suppression) {
+        g_stick_suppression = xinput_shown || native;
+        gl_set_host_capabilities(g_gyro->get(), GL_HOST_MENU_STATE | (g_stick_suppression ? GL_HOST_NATIVE_STICK_SUPPRESSION : 0u));
+    }
 
     double gyro_deg = 0;  // gyro rotation actually written this frame
     const double pitch = out.pitch_degrees, yaw = out.yaw_degrees;
@@ -878,6 +1297,12 @@ void host_configure(const std::wstring& mod_dir, const std::wstring& exe_stem) {
     g_settings_path = mod_dir + L"\\GyroUE.ini";
     g_profile_path = mod_dir + L"\\profiles\\" + exe_stem + L".ini";
     load_profile();
+    nativepad::install(setting(L"NativeFlickStick", 0) != 0);
+    xinput::Settings xs;
+    xs.mode = setting(L"XInput", xinput::Auto);
+    xs.nintendo_labels = setting(L"XInputNintendoLabels", 0) != 0;
+    xs.touchpad_back = setting(L"XInputTouchpadBack", 1) != 0;
+    xinput::install(xs);
 }
 
 bool host_frame() {

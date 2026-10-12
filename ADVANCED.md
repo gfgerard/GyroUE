@@ -14,14 +14,19 @@ play.
   rotators on UE4, double rotators on UE5).
 - **Per-game profiles** for games with custom cameras: vehicle views, camera components, or non-reflected
   C++ camera state reached by raw offset.
+- **Xbox controller translation:** a controller the game can't read (DualSense, Switch Pro, DirectInput pads,
+  without Steam Input) is shown to it as an XInput controller, from the same SDL device GyroLib reads. Automatic
+  only when the game doesn't read pads itself (see [How it works](#how-it-works)).
 - **Gameplay gating:** the gyro stops in menus, pause, main menu, while the mouse cursor is shown, and when
   the game window loses focus.
 - **Automatic calibration** in menus (GyroLib's "menus only" mode), including games whose gamepad menus
   show no cursor.
 - **In-game settings panel** (GyroLib's DX12 overlay, `F10` by default): sensitivity, activation button or
   trigger, invert axes, smoothing and more, saved to `gyrolib.ini`. Edits to `gyrolib.ini` are also reloaded
-  live while the game runs. GyroUE declares only `GL_HOST_MENU_STATE` to GyroLib: no native stick or touchpad
-  suppression, no long-press blocking and no recenter callback (see [Current scope](README.md#current-scope)).
+  live while the game runs. GyroUE declares `GL_HOST_MENU_STATE` to GyroLib, plus native right-stick
+  suppression while it translates the controller to XInput or while the game reads a PlayStation controller itself
+  through a checked report layout (`NativeFlickStick`): no touchpad suppression, no long-press blocking and
+  no recenter callback (see [Current scope](README.md#current-scope)).
 - **Coexists with ReShade, RenoDX (HDR) and the Steam overlay.** Panel rendering runs on GyroUE's own
   thread, so it keeps working when the engine moves `Present`/`ResizeBuffers` between threads.
 - **Diagnostics for new games:** a status line every 10 s in `GyroUE.log`, plus an optional probe (`F7`
@@ -36,7 +41,8 @@ play.
 | Cronos: The New Dawn | UE 5.4 | yes | The camera ignores `ControlRotation`; the profile writes the look rotation inside the pawn's `View` component. Panel verified with HDR + RenoDX. |
 | Gears of War: E-Day | UE 5.6 (Xbox / Game Pass build) | no | Generic path, campaign tested *WITH EAC DISABLED*. Install in `Binaries\WinGDK` renamed to `version.dll` (with RivaTuner running, the game loads the system `winmm.dll` first). Protected exe: GyroUE switches to inline hooks and finds the engine objects with a heap scan, so the gyro becomes available a few seconds after the main menu appears. The game ships EasyAntiCheat: don't use GyroUE in online modes. |
 | Life is Strange Remastered | UE 4 (pre-4.25 property system), DX11 | yes (shipped) | Found with the camera probe. The camera splits pitch and yaw across two raw rotators, and the walking camera blends back to an automatic follow camera unless it gets look input; the profile writes `OnGyro=` to keep it manual. No settings panel (DX11): configure via `gyrolib.ini`. |
-| Luto | UE 5.5.4 | no | Generic path working OOB |
+| Luto | UE 5.5.4 | no | Generic path working OOB. Only reads XInput: GyroUE shows the DualSense / Switch Pro as an Xbox controller (Epic, no Steam Input). |
+| The Outer Worlds: Spacer's Choice Edition | UE 4 | no | Generic path. Native DualSense (delay-loaded `libScePad.dll`): XInput translation stays off. |
 
 Tested with a DualSense over USB/BT and Nintendo Switch Pro Controller. Requirements and limits:
 
@@ -66,6 +72,14 @@ All diagnostics go to `GyroUE\GyroUE.log` (probe results, if enabled, to `GyroUE
 | Camera drifts slowly | Rest the pad in a menu for a few seconds (`bias=` in the status line should become non-zero) or use "Recalibrate gyro". |
 | Panel doesn't open | Look for `overlay:` lines. Try from the game's pause menu. As a fallback, edit `gyrolib.ini` directly. |
 | Double motion | Steam Input or another tool is also converting the gyro to mouse. |
+| `ue: core classes not found` (and a notice after 60 s) | GyroUE can't read this game's engine data, so nothing can turn the camera and the probe can't help. Report the game with the log: the `ue: core classes missing:` line says what was found instead. |
+| `xinput: ... shown as XInput controller N` | The controller is translated to an Xbox controller in slot N. |
+| `xinput: ... not shown: <reason>` | Why it isn't: an Xbox/Steam Input/remapper controller is connected, or the game reads pads itself (Sony's pad library, its own SDL, Raw Input for gamepads, the controller's HID device, DirectInput). `XInput=2` overrides the last group. |
+| `nativepad: the game reads 054C:0CE6 (...): N bytes, first byte 0x31, report 0x31 (DualSense, Bluetooth)` | The game reads the controller itself (Sony's pad library). `unknown layout, left alone` means a report GyroUE doesn't know: no native flick stick for it. |
+| `nativepad: ... matches SDL` / `native right-stick suppression available` | The right stick in the game's reports agreed with SDL while you moved it: GyroLib's flick options are offered. `doesn't match SDL` or `CRC isn't the expected one`: GyroUE leaves the reports alone (report it with the log). |
+| `nativepad: right stick centred in the game's reports` | Flick stick is active: the game sees a centred right stick (`passed through` when it stops, e.g. in menus). |
+| `xinput: XInput=2: the game's access to HID device 054C:0CE6 refused` | With `XInput=2` the game tried to open the controller itself (its own DualSense support) and was refused, so it only gets the Xbox controller. `Raw Input registration ... dropped` is the same for Raw Input. |
+| `xinput: XInputGetState hook registered, no game module imports it yet` | The game hasn't loaded its XInput code yet, or uses another input API (then there is nothing to translate). |
 | `deps:` lines | Before loading GyroLib, GyroUE checks which copy of each DLL GyroLib shares with the game (Visual C++ runtime, SDL3): one already loaded by the game, or one next to its exe, is the one GyroLib gets. `older than 14.40, GyroLib ... would crash the game` turns the gyro off for the session (the game still starts) and shows the fix: rename the game's copies so Windows' newer ones are used. `older than GyroLib's build tools` and `the game's own SDL3` are warnings only. |
 
 ## How it works
@@ -92,6 +106,29 @@ DualSense --HID--> SDL3 (inside gyrolib.dll)
   System32 DXGI factory (so it doesn't fight Streamline, ReShade or RivaTuner over the `dxgi.dll` exports). The log says
   which mode is used (`hooks: ... import-table hooks` / `inline hooks on exports`); `GYROUE_INLINE=1` in the
   environment forces inline mode.
+- Xbox controller translation: the game's imports of `XInputGetState`, `XInputSetState`, `XInputGetCapabilities`,
+  `XInputEnable` (by name or ordinal, including delay-loaded ones: UE 5 delay-loads `XINPUT1_4.dll`) and
+  `XInputGetStateEx` are patched in the game modules only, so SDL inside GyroLib never sees the virtual controller.
+  Once per frame GyroUE copies the SDL state of GyroLib's selected controller into the slot it answers for (the
+  first one with no real controller), and turns `XInputSetState` into SDL rumble. In auto mode it waits 2 s after
+  the controller appears, and stays off if a real XInput controller is connected or the game shows signs of reading
+  pads itself: `libScePad*.dll`, `hid.dll` or an SDL of its own imported (also delay-load), or such a library loaded, `RegisterRawInputDevices` for joysticks/gamepads,
+  `CreateFileW` on the controller's HID device, or `DirectInput8Create`. When the controller appears or goes, it
+  posts `WM_DEVICECHANGE` to the game's `UnrealWindow`s, because Unreal only checks empty XInput slots after that
+  message. With `XInput=2` the game's `CreateFileW` on PlayStation/Nintendo HID devices (and the selected
+  controller's) fails with access denied, also inside a separate `libScePad.dll` (whose import table is patched for
+  that hook only), and its Raw Input registrations for joysticks/gamepads are dropped: Sony's pad library and
+  direct HID code then see no controller, as when another program holds it exclusively. Not available on
+  protected exes (inline-hook mode).
+- Flick stick with the game's own PlayStation controller support (`NativeFlickStick=1`, `nativepad.cpp`): Sony's pad
+  library (as `libScePad.dll` or linked into the exe) opens the controller's HID device with `CreateFileW` and reads
+  input reports with `ReadFile` / `GetOverlappedResult(Ex)`. GyroUE follows the Sony handles the game opens for
+  reading (`CloseHandle` ends that) and, when a read completes, notes the right stick in every report it returned
+  (one read can hold several, of the device's `InputReportByteLength`): report `0x01` (USB, bytes
+  3-4), `0x31` (DualSense Bluetooth, bytes 4-5) or `0x11` (DualShock 4 Bluetooth, bytes 5-6); Bluetooth reports
+  must carry the expected CRC32 (0xA1 + report). Once that stick agrees with SDL's while it is held away from the
+  centre, GyroUE declares native stick suppression to GyroLib; while GyroLib then asks for it, the stick bytes in the
+  game's copy are set to 128 (and the CRC recomputed). The controller and GyroLib's own SDL reading are untouched.
 - Every memory read through reflection is guarded, so a missing object or property disables the feature
   instead of crashing the game.
 - The settings panel hooks DXGI factory and swapchain vtables (`Present`, `ResizeBuffers`) and subclasses
@@ -207,44 +244,50 @@ the game window has focus. If the game uses those keys for something, press them
 
 ### 3. Capture camera turns
 
-**Automatic (recommended).** With `Probe=1` GyroUE captures by itself:
+**Automatic (recommended).** With `Probe=1` GyroUE finds the camera by itself and tells you on screen what to do.
+The gyro output is **paused** while it runs, so the controller can stay in your hands.
 
-1. Load into gameplay and stand still for a second. GyroUE takes a snapshot
-   (`GyroUE.log`: `probe: automatic capture ready ...`). The gyro output is **paused** while the probe captures,
-   so the controller can stay in your hands.
-2. Turn the camera **with the right stick**, more than 30° sideways (and a bit up or down), then stop. GyroUE
-   detects the turn and compares. Camera turns made without the right stick (cutscenes, scripted cameras) are
-   ignored.
-3. Repeat 3 or 4 times (up to 8 are captured per session; then the gyro output resumes).
+1. **Captures.** Load into gameplay and stand still for a second (`GyroUE.log`: `probe: automatic capture ready ...`).
+   Turn the camera **with the right stick**, more than 30° sideways (and a bit up or down), then stop. Repeat until
+   the notice says 3 captures are done. Camera turns made without the right stick (cutscenes, scripted cameras) are
+   ignored. Every rotation that followed the camera in the captures becomes a candidate: one that now holds the
+   camera's pitch and yaw, or one that changed by exactly the camera's turn (a copy kept with an offset or a small
+   lag; Hogwarts Legacy keeps its look rotation 3° above the final pitch).
+2. **Live test. Don't touch the controller.** GyroUE writes a 3° turn into each candidate, exactly as a profile would,
+   and watches the camera: it must turn by that amount and come back when the turn is undone, first in yaw and then
+   in pitch. The camera twitches a little. A candidate the game rewrites every frame (an output), or that keeps the
+   turn without moving the camera, fails. For a third-person camera the probe also checks the camera's location:
+   the stick orbits it around the character (the captures measure the radius), so a candidate that only turns the
+   view on the spot (a free camera) fails too. The ones that pass are tested again in a second round. Touching the stick,
+   pausing or leaving gameplay pauses the test (it retries).
+3. **Result.** A rotation that passed both rounds is **verified live**:
+   - **The game has no profile:** GyroUE writes it, `GyroUE\profiles\<game exe>.ini`. Restart the game to use it.
+   - **The game already has a profile:** it is left untouched; the result goes to `<game exe>.suggested.ini` next to
+     it. To use it, rename it to `<game exe>.ini` (replacing the old one) and restart.
 
-From the second capture on, GyroUE ranks every rotation that held the camera's pitch and yaw in all the captures,
-drops the camera's outputs (camera manager, component transforms) and writes the result (also copied at the end of
-`GyroUE-probe.log`):
+   If nothing passes, GyroUE asks for more captures (up to 8) and tests the new candidates. After that it writes only
+   an unverified guess to `<game exe>.suggested.ini`; **an unverified guess never becomes the game's profile.**
 
-- **The game has no profile:** GyroUE writes the game's profile itself, `GyroUE\profiles\<game exe>.ini`, and keeps
-  updating it with every capture of that session. Restart the game to use it.
-- **The game already has a profile:** it is left untouched; the result goes to `<game exe>.suggested.ini` next to it.
-  To try it, rename it to `<game exe>.ini` (replacing the old one) and restart.
-- A result with no usable rotation never becomes the profile (it only goes to `.suggested.ini` and the probe log).
-
-For Cronos the profile should read (the answer the manual probe found):
+Every test and its result is in `GyroUE-probe.log` (`probe test (round N): <rotation>: MOVES THE CAMERA` /
+`overwritten (output)` / `kept, camera didn't move` / ...), and the profile file lists every other rotation with
+what the live test said about it. For Hogwarts Legacy, for example, the probe should verify:
 
 ```ini
-; GyroUE 0.6.4 profile for Cronos-Win64-Shipping, created by the camera probe (3 scored captures, ...).
-; NOT VERIFIED. Restart the game to use it, then set Probe=0 in GyroUE\GyroUE.ini.
+; VERIFIED LIVE: the probe wrote small turns into this rotation and the camera followed them, twice.
 [View.Default]
 Label=Camera
-Object=Pawn.View
-Offsets=0x2A0,0x420
-RotatorSize=24
+Object=ViewTarget.BehaviorStack
+Offsets=0x68,0x80
+RotatorSize=12
 ```
 
-Once the camera follows the gyro, set `Probe=0` again in `GyroUE\GyroUE.ini`. If it still ignores the gyro, the file
-lists alternatives to try one at a time; the steps below explain how to read the full probe output.
+Once the camera follows the gyro, set `Probe=0` again in `GyroUE\GyroUE.ini`. Even a verified profile was only tested
+on the camera of the captures: a game with other cameras (vehicles, aiming) may need more views (see below).
 
 **Manual.** `F7` takes a snapshot, turn the camera with the right stick only (well over 30° to one side **and**
 some degrees up or down, without walking), `F8` logs the diff to `GyroUE-probe.log`. Diffs with a large enough turn
-also feed the suggested profile. Pressing `F7`/`F8` turns the automatic capture off for the session.
+feed an unverified guess in `<game exe>.suggested.ini` (no live test in manual mode). Pressing `F7`/`F8` turns the
+automatic probe off for the session.
 
 ### 4. Read the probe output
 

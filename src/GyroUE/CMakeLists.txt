@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(GyroUE VERSION 0.7.0 LANGUAGES C CXX)  # the one place the GyroUE version lives (DLL log line + release zip name)
+project(GyroUE VERSION 0.8.0 LANGUAGES C CXX)  # the one place the GyroUE version lives (DLL log line + release zip name)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")  # static CRT: one less DLL to ship
 
@@ -14,7 +14,7 @@ target_include_directories(minhook PUBLIC "${MINHOOK_DIR}/include")
 
 # Version resource (file properties: description, product name, version) from project() above.
 configure_file(version.rc.in "${CMAKE_CURRENT_BINARY_DIR}/version.rc" @ONLY)
-add_library(GyroUE SHARED dllmain.cpp proxy.cpp host.cpp hooks.cpp overlay.cpp perf.cpp ue.cpp log.cpp notify.cpp deps.cpp proxy.def
+add_library(GyroUE SHARED dllmain.cpp proxy.cpp host.cpp hooks.cpp overlay.cpp perf.cpp ue.cpp log.cpp notify.cpp deps.cpp xinput.cpp nativepad.cpp proxy.def
             "${CMAKE_CURRENT_BINARY_DIR}/version.rc")
 set_target_properties(GyroUE PROPERTIES OUTPUT_NAME winmm)
 target_compile_definitions(GyroUE PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE "GYROUE_VERSION=\"${PROJECT_VERSION}\"")

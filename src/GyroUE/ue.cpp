@@ -442,6 +442,14 @@ bool find_name_pool(const std::vector<Range>& sections) {
             uint32_t current_block = 0;
             if (!rd(a - 8, current_block) || current_block >= 8192) continue;
             if (!rdp(a + current_block * 8ull, 2)) continue;
+            // The allocator fills blocks in order: every block up to CurrentBlock exists, none after it. Hogwarts
+            // Legacy has another table that also starts with block 0 (CurrentBlock 0, block 1 null, blocks 2+ set)
+            // before the real pool in .data; taking it decoded every name past block 0 as garbage.
+            bool in_order = true;
+            for (uint32_t b = 1; b <= current_block && in_order; ++b) in_order = rdp(a + b * 8ull, 2) != 0;
+            for (uint32_t b = current_block + 1; b <= current_block + 4 && b < 8192 && in_order; ++b)
+                in_order = rdp(a + b * 8ull, 2) == 0;
+            if (!in_order) continue;
             const uint16_t h = uint16_t(uint8_t(bytes[0]) | (uint8_t(bytes[1]) << 8));
             if ((h >> 6) == 4 && !(h & 1)) g_header_len_high = true;
             else if ((h & 0x3FF) == 4) g_header_len_high = false;
@@ -480,6 +488,34 @@ uintptr_t find_field(uintptr_t first, int next_off, int name_off, const char* na
     return 0;
 }
 
+// Once per session, when the core classes aren't found: what the object array holds instead (Hogwarts Legacy).
+void log_missing_classes(Obj object_cls, Obj actor_cls, Obj controller_cls) {
+    static bool logged = false;
+    if (logged) return;
+    logged = true;
+    const int32_t n = object_count();
+    int32_t classes = 0;
+    std::string sample;
+    for (int32_t i = 0; i < n; ++i) {
+        const Obj o = object_at(i);
+        if (!o || rdp(o + kObjClass) != g_class_class) continue;
+        if (++classes <= 12) sample += (sample.empty() ? "" : ", ") + fname(o + kObjName);
+    }
+    log("ue: core classes missing:%s%s%s; %d of %d objects are classes (first: %s)", object_cls ? "" : " Object",
+        actor_cls ? "" : " Actor", controller_cls ? "" : " Controller", classes, n, sample.c_str());
+    for (const char* name : {"Object", "Actor", "Controller"}) {
+        for (int32_t i = 0; i < n; ++i) {
+            const Obj o = object_at(i);
+            if (!o || fname(o + kObjName) != name) continue;
+            const Obj cls = rdp(o + kObjClass);
+            log("ue:   an object named %s is #%d, class %s (0x%llX; Class is 0x%llX)", name, i,
+                cls ? fname(cls + kObjName).c_str() : "(null)", static_cast<unsigned long long>(cls),
+                static_cast<unsigned long long>(g_class_class));
+            break;
+        }
+    }
+}
+
 bool detect_layout() {
     // UClass "Class" is its own class.
     const int32_t n = object_count();
@@ -490,7 +526,10 @@ bool detect_layout() {
     if (!g_class_class) return log("ue: UClass 'Class' not found"), false;
 
     const Obj object_cls = find_class("Object"), actor_cls = find_class("Actor"), controller_cls = find_class("Controller");
-    if (!object_cls || !actor_cls || !controller_cls) return log("ue: core classes not found"), false;
+    if (!object_cls || !actor_cls || !controller_cls) {
+        log_missing_classes(object_cls, actor_cls, controller_cls);
+        return log("ue: core classes not found"), false;
+    }
 
     for (int off = 0x28; off <= 0x80 && g_super < 0; off += 8)
         if (rdp(actor_cls + off) == object_cls && rdp(controller_cls + off) == actor_cls) g_super = off;
@@ -860,13 +899,19 @@ struct Candidate {
     std::string property;  // reflected rotator ("" = raw)
     int32_t offset = -1;   // raw rotator offset (pitch, then yaw)
     int size = 0;          // 12 = float rotator, 24 = double rotator
-    int hits = 0;          // scored diffs in which it held the camera's pitch and yaw
+    int hits = 0;          // scored diffs in which it followed the camera's pitch and yaw
+    int exact = 0;         // ... of which it held the camera's exact values (else it moved by the same amount)
     std::string why_not;   // "" = usable in a profile, else why it is ignored
     bool world = false;    // a component's RelativeRotation with absolute rotation: the profile needs WorldRotation=1
     bool camera = false;   // ... of a CameraComponent (the engine takes the view from it)
 };
 std::map<std::string, Candidate> g_candidates;
 int g_scored_diffs = 0;
+struct Verdict {
+    int result = kUntested;
+    std::string note;
+};
+std::map<std::string, Verdict> g_verdicts;  // live test results by ProbeGroup id
 
 int32_t properties_size(Obj cls) {  // UStruct::PropertiesSize follows ChildProperties (UE 4.25-5.x)
     int32_t n = 0;
@@ -912,11 +957,25 @@ void split_label(const std::string& label, std::string& object, std::string& cls
 }
 
 // Records one hit for a candidate (once per diff).
-void score(const std::string& key, Candidate c, std::vector<std::string>& seen) {
+void score(const std::string& key, Candidate c, std::vector<std::string>& seen, bool exact) {
     if (std::find(seen.begin(), seen.end(), key) != seen.end()) return;
     seen.push_back(key);
     auto [it, inserted] = g_candidates.try_emplace(key, std::move(c));
     ++it->second.hits;
+    if (exact) ++it->second.exact;
+}
+
+// A rotation (pitch p, yaw y; p0/y0 at the snapshot) followed the camera, whose POV is now `now` after turning by
+// (dp, dy): it holds the POV's exact values, or it changed by the same amounts (a copy kept with an offset or a
+// small lag: Hogwarts Legacy's camera stack keeps its pitch 3 degrees above the POV's). The scored turn is at least
+// 10 degrees of yaw, so an unrelated value matching both changes is unlikely; the live test decides anyway.
+bool follows(double p0, double y0, double p, double y, const double now[3], double dp, double dy, bool& exact) {
+    exact = false;
+    if (!std::isfinite(p) || !std::isfinite(y) || !std::isfinite(p0) || !std::isfinite(y0)) return false;
+    if (std::abs(p) > 360 || std::abs(y) > 1e5 || near_angle(y0, y)) return false;  // not an angle, or didn't turn
+    if (near_angle(y, now[1]) && std::abs(p - now[0]) <= 0.6) return exact = true;
+    const double tol_y = (std::max)(0.6, std::abs(dy) * 0.03), tol_p = (std::max)(0.6, std::abs(dp) * 0.03);
+    return std::abs(wrap180((y - y0) - dy)) < tol_y && std::abs((p - p0) - dp) < tol_p;
 }
 
 void collect_struct(uintptr_t base, Obj st, const std::string& prefix, int depth);
@@ -1095,29 +1154,89 @@ bool camera_pov(Obj camera, double& pitch, double& yaw) {
            std::isfinite(yaw);
 }
 
+bool camera_pov_location(Obj camera, double location[3]) {
+    if (!g_ready || !camera) return false;
+    static Obj cached_class = 0;
+    static int32_t offset = -1, size = 0;
+    const Obj cls = class_of(camera);
+    if (cls != cached_class) {
+        cached_class = cls;
+        offset = -1;
+        for (const char* cache : {"CameraCachePrivate", "CameraCache"}) {
+            const Prop c = find_prop(cls, cache);
+            const Prop pov = c ? find_prop(struct_type(c), "POV") : Prop{};
+            const Prop loc = pov ? find_prop(struct_type(pov), "Location") : Prop{};
+            if (loc && (loc.element_size == 12 || loc.element_size == 24)) {
+                offset = c.offset + pov.offset + loc.offset;
+                size = loc.element_size;
+                break;
+            }
+        }
+    }
+    if (offset < 0) return false;
+    for (int i = 0; i < 3; ++i) {
+        if (size == 24) {
+            if (!rd(camera + offset + i * 8, location[i])) return false;
+        } else {
+            float f = 0;
+            if (!rd(camera + offset + i * 4, f)) return false;
+            location[i] = f;
+        }
+        if (!std::isfinite(location[i])) return false;
+    }
+    return true;
+}
+
 size_t probe_snapshot(const std::vector<std::pair<std::string, Obj>>& roots) {
     g_leaves.clear();
     if (!g_ready) return 0;
     // Each object is labelled with its profile path, e.g. "Pawn.View(SHCharacterPlayViewComponent)":
     // the part before "(" can be used as Object= in a profile view.
-    std::vector<std::pair<Obj, std::string>> objects;
+    struct Found {
+        Obj o, root;
+        std::string role;
+    };
+    std::vector<Found> found;
+    // First object (by index) under each outer whose class chain has each class name: what "@Class" resolves to.
+    std::map<std::pair<Obj, std::string>, Obj> first_of;
     const int32_t n = object_count();
     for (int32_t i = 0; i < n; ++i) {
         const Obj o = object_at(i);
         if (!o || is_cdo(o)) continue;
-        std::string path;
+        std::string role;
         Obj x = o;
-        for (int d = 0; x && d < 8 && path.empty(); ++d) {
-            for (const auto& [role, r] : roots)
-                if (r && x == r && path.empty()) path = role;
-            if (path.empty()) x = rdp(x + kObjOuter);
+        for (int d = 0; x && d < 8 && role.empty(); ++d) {
+            for (const auto& [r_name, r] : roots)
+                if (r && x == r && role.empty()) role = r_name;
+            if (role.empty()) x = rdp(x + kObjOuter);
         }
-        if (path.empty()) continue;
-        for (Obj y = o; y && y != x; y = rdp(y + kObjOuter)) {
+        if (role.empty()) continue;
+        found.push_back({o, x, role});
+        if (o == x) continue;
+        Obj c = class_of(o);
+        for (int depth = 0; c && depth < 64; ++depth, c = rdp(c + g_super)) first_of.try_emplace({rdp(o + kObjOuter), name_of(c)}, o);
+    }
+    // A path step: the object's name, or "@Class" when the name is generated ("<Class>_<number>", a new number every
+    // session, e.g. Hogwarts Legacy's CameraStackBehaviorConvertToTranslation_2147460121) and "@Class" finds it.
+    auto step = [&](Obj y) {
+        const std::string name = name_of(y), cls = name_of(class_of(y));
+        const bool generated = name.size() > cls.size() + 1 && name.compare(0, cls.size(), cls) == 0 &&
+                               name[cls.size()] == '_' &&
+                               name.find_first_not_of("0123456789", cls.size() + 1) == std::string::npos;
+        if (generated) {
+            const auto it = first_of.find({rdp(y + kObjOuter), cls});
+            if (it != first_of.end() && it->second == y) return "@" + cls;
+        }
+        return name;
+    };
+    std::vector<std::pair<Obj, std::string>> objects;
+    for (const Found& f : found) {
+        std::string path = f.role;
+        for (Obj y = f.o; y && y != f.root; y = rdp(y + kObjOuter)) {
             const size_t root_len = path.find('.') == std::string::npos ? path.size() : path.find('.');
-            path.insert(root_len, "." + name_of(y));
+            path.insert(root_len, "." + step(y));
         }
-        objects.emplace_back(o, path + "(" + name_of(class_of(o)) + ")");
+        objects.emplace_back(f.o, path + "(" + name_of(class_of(f.o)) + ")");
     }
     for (const auto& [o, label] : objects) {
         const std::string prefix = label + ".";
@@ -1251,7 +1370,8 @@ int probe_diff(bool verbose) {
         reflected.push_back(l.address);
         double v[3];
         if (&l == pov || !read_leaf(l, v)) continue;
-        if (!near_angle(v[1], now[1]) || std::abs(v[0] - now[0]) > 0.6 || near_angle(l.base[1], v[1])) continue;
+        bool exact = false;
+        if (!follows(l.base[0], l.base[1], v[0], v[1], now, dp, dy, exact)) continue;
         Candidate c;
         split_label(l.label, c.object, c.cls, c.property);
         c.size = l.kind == 2 ? 12 : 24;
@@ -1265,9 +1385,11 @@ int probe_diff(bool verbose) {
         } else if (c.property.find("RelativeRotation") != std::string::npos) c.why_not = "component transform (output)";
         else if (c.object == "PC" && c.property == "ControlRotation") c.why_not = "the default view (already tried)";
         else if (c.property.find('.') != std::string::npos) c.why_not = "nested in a struct (not usable as Property=)";
-        score(c.object + "|" + c.property, c, seen);
+        score(c.object + "|" + c.property, c, seen, exact);
         ++found;
-        if (!verbose) probe_log("  candidate %s (%s rotator)", l.label.c_str(), l.kind == 2 ? "float" : "double");
+        if (!verbose)
+            probe_log("  candidate %s (%s rotator%s)", l.label.c_str(), l.kind == 2 ? "float" : "double",
+                      exact ? "" : ", moved by the same amount");
     }
     for (const RawObj& r : g_raw) {
         std::vector<uint8_t> cur(r.bytes.size());
@@ -1280,19 +1402,22 @@ int probe_diff(bool verbose) {
         for (int wide = 0; wide < 2; ++wide) {
             const size_t elem = wide ? 8 : 4;
             for (size_t off = 0x28; off + 2 * elem <= cur.size(); off += elem) {
-                double p = 0, y = 0, y0 = 0;
+                double p = 0, y = 0, p0 = 0, y0 = 0;
                 if (wide) {
                     std::memcpy(&p, &cur[off], 8);
                     std::memcpy(&y, &cur[off + 8], 8);
+                    std::memcpy(&p0, &r.bytes[off], 8);
                     std::memcpy(&y0, &r.bytes[off + 8], 8);
                 } else {
-                    float fp, fy, fy0;
+                    float fp, fy, fp0, fy0;
                     std::memcpy(&fp, &cur[off], 4);
                     std::memcpy(&fy, &cur[off + 4], 4);
+                    std::memcpy(&fp0, &r.bytes[off], 4);
                     std::memcpy(&fy0, &r.bytes[off + 4], 4);
-                    p = fp, y = fy, y0 = fy0;
+                    p = fp, y = fy, p0 = fp0, y0 = fy0;
                 }
-                if (!near_angle(y, now[1]) || std::abs(p - now[0]) > 0.6 || near_angle(y0, y)) continue;
+                bool exact = false;
+                if (!follows(p0, y0, p, y, now, dp, dy, exact)) continue;
                 if (std::find(reflected.begin(), reflected.end(), r.o + off) != reflected.end()) continue;
                 Candidate c;
                 std::string ignored;
@@ -1304,10 +1429,11 @@ int probe_diff(bool verbose) {
                 else if (scene > 0 && int32_t(off) < scene) c.why_not = "component transform (output)";
                 char key[32];
                 std::snprintf(key, sizeof key, "|+0x%X|%d", c.offset, c.size);
-                score(c.object + key, c, seen);
+                score(c.object + key, c, seen, exact);
                 ++found;
                 if (!verbose)
-                    probe_log("  candidate %s+0x%zX (%s rotator)", r.label.c_str(), off, wide ? "double" : "float");
+                    probe_log("  candidate %s+0x%zX (%s rotator%s)", r.label.c_str(), off, wide ? "double" : "float",
+                              exact ? "" : ", moved by the same amount");
             }
         }
     }
@@ -1317,46 +1443,79 @@ int probe_diff(bool verbose) {
     return g_scored_diffs;
 }
 
-std::string probe_suggestion(const std::string& exe_stem, std::string& summary, bool as_profile) {
-    summary.clear();
-    if (g_scored_diffs < 2) return {};
-    // Usable candidates that followed the camera in every scored diff (or all but one, from 4 on).
-    const int needed = g_scored_diffs >= 4 ? g_scored_diffs - 1 : g_scored_diffs;
-    std::vector<const Candidate*> usable, ignored;
+std::vector<ProbeGroup> probe_groups() {
+    std::vector<ProbeGroup> groups;
+    if (g_scored_diffs < 2) return groups;
+    // Followed the camera in most scored diffs, at least two. Not all: a look rotation kept with an offset that depends
+    // on the pitch (Hogwarts Legacy's framing) can miss a capture with a large pitch change. The live test decides.
+    const int needed = (std::max)(2, (g_scored_diffs + 1) / 2);
+    std::vector<int> rank;
     for (const auto& [key, c] : g_candidates) {
         if (c.hits < needed) continue;
-        (c.why_not.empty() ? usable : ignored).push_back(&c);
-    }
-    // Group by object: one view per object (all its raw rotators get the delta, like Cronos' two copies).
-    struct Group {
-        std::string object, cls, property;
-        std::vector<int32_t> offsets;
-        int size = 0, hits = 0, rank = 0;
-        bool world = false;
-    };
-    std::vector<Group> groups;
-    for (const Candidate* c : usable) {
-        auto it = std::find_if(groups.begin(), groups.end(), [&](const Group& g) {
-            return g.object == c->object && g.property.empty() == c->property.empty() && (!c->property.empty() || g.size == c->size);
+        // One group per object for raw rotators of one size (a profile writes all its offsets, like Cronos' two
+        // copies), one per reflected property. A raw group is usable if any of its rotators is.
+        auto it = std::find_if(groups.begin(), groups.end(), [&](const ProbeGroup& g) {
+            return c.property.empty() && g.property.empty() && g.object == c.object && g.size == c.size;
         });
-        if (it == groups.end() || !c->property.empty()) {
-            Group g{c->object, c->cls, c->property, {}, c->size, 0, 0, c->world};
+        if (it == groups.end()) {
+            ProbeGroup g;
+            g.object = c.object, g.cls = c.cls, g.property = c.property, g.size = c.size, g.world = c.world;
+            g.why_not = c.why_not;
+            g.id = c.object + "|" + (c.property.empty() ? "raw" + std::to_string(c.size) : c.property);
+            groups.push_back(g);
             // Inputs usually live in the pawn or its components; then the view target, then the controller and the
             // camera manager's own fields. A camera component with absolute rotation comes first: the engine takes
             // the view from it, and only the game sets its rotation.
-            g.rank = c->camera ? 4 : c->object.rfind("Pawn", 0) == 0 ? 3 : c->object.rfind("ViewTarget", 0) == 0 ? 2 : 1;
-            groups.push_back(g);
+            rank.push_back(c.camera ? 4 : c.object.rfind("Pawn", 0) == 0 ? 3 : c.object.rfind("ViewTarget", 0) == 0 ? 2 : 1);
             it = groups.end() - 1;
+        } else if (c.why_not.empty()) {
+            it->why_not.clear();
         }
-        if (c->property.empty()) it->offsets.push_back(c->offset);
-        it->hits = (std::max)(it->hits, c->hits);
+        if (c.property.empty()) it->offsets.push_back(c.offset);
+        it->hits = (std::max)(it->hits, c.hits);
+        it->exact = (std::max)(it->exact, c.exact);
     }
-    std::sort(groups.begin(), groups.end(), [](const Group& a, const Group& b) {
-        if (a.rank != b.rank) return a.rank > b.rank;
-        if (a.offsets.size() != b.offsets.size()) return a.offsets.size() > b.offsets.size();
-        return a.property.empty() < b.property.empty();  // reflected (named) before raw at equal rank
+    for (ProbeGroup& g : groups) {
+        std::sort(g.offsets.begin(), g.offsets.end());
+        if (auto v = g_verdicts.find(g.id); v != g_verdicts.end()) g.verdict = v->second.result, g.note = v->second.note;
+    }
+    std::vector<size_t> order(groups.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        const ProbeGroup &ga = groups[a], &gb = groups[b];
+        if (ga.why_not.empty() != gb.why_not.empty()) return ga.why_not.empty();
+        if (rank[a] != rank[b]) return rank[a] > rank[b];
+        if (ga.offsets.size() != gb.offsets.size()) return ga.offsets.size() > gb.offsets.size();
+        return ga.property.empty() < gb.property.empty();  // reflected (named) before raw at equal rank
     });
-    auto view_lines = [](const Group& g, const char* indent) {
+    std::vector<ProbeGroup> sorted;
+    for (size_t i : order) sorted.push_back(groups[i]);
+    return sorted;
+}
+
+void probe_verdict(const std::string& id, int verdict, const std::string& note) { g_verdicts[id] = {verdict, note}; }
+
+std::string probe_suggestion(const std::string& exe_stem, std::string& summary, bool as_profile, bool& verified) {
+    summary.clear();
+    verified = false;
+    if (g_scored_diffs < 2) return {};
+    const std::vector<ProbeGroup> groups = probe_groups();
+    // The pick: a group that moved the camera in the live test, else the passive best guess (usable groups the
+    // live test didn't reject).
+    const ProbeGroup* best = nullptr;
+    for (const ProbeGroup& g : groups)
+        if (g.verdict == kMovesCamera) {
+            best = &g;
+            verified = true;
+            break;
+        }
+    if (!best)
+        for (const ProbeGroup& g : groups)
+            if (g.why_not.empty() && g.verdict == kUntested && (g.property.empty() || g.property.find('.') == std::string::npos)) {
+                best = &g;
+                break;
+            }
+    auto view_lines = [](const ProbeGroup& g, const char* indent) {
         std::string s = std::string(indent) + "Object=" + g.object + "\n";
         if (!g.property.empty())
             return s + indent + "Property=" + g.property + "\n" + (g.world ? std::string(indent) + "WorldRotation=1\n" : "");
@@ -1364,45 +1523,62 @@ std::string probe_suggestion(const std::string& exe_stem, std::string& summary, 
         for (int32_t off : g.offsets) offsets += (offsets.empty() ? "" : ",") + std::format("0x{:X}", off);
         return s + indent + "Offsets=" + offsets + "\n" + indent + "RotatorSize=" + std::to_string(g.size) + "\n";
     };
+    auto result = [](const ProbeGroup& g) -> std::string {
+        switch (g.verdict) {
+        case kMovesCamera: return "moved the camera in the live test" + (g.note.empty() ? "" : " (" + g.note + ")");
+        case kOverwritten: return "live test: the game overwrote it (an output)";
+        case kNoEffect: return "live test: kept but the camera didn't move";
+        case kUntestable: return "live test: " + (g.note.empty() ? std::string("not testable") : g.note);
+        case kInconsistent: return "live test: moved the camera once, not the second time" + (g.note.empty() ? "" : " (" + g.note + ")");
+        case kTurnsInPlace: return "live test: turned the view in place, the camera didn't orbit like with the stick" +
+                                   (g.note.empty() ? "" : " (" + g.note + ")");
+        default: return g.why_not.empty() ? "not tested live" : g.why_not;
+        }
+    };
 
     SYSTEMTIME t;
     GetLocalTime(&t);
+    const std::string when = std::format("{:04}-{:02}-{:02} {:02}:{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
     std::string text =
         as_profile
-            ? std::format("; GyroUE {} profile for {}, created by the camera probe ({} scored captures, "
-                          "{:04}-{:02}-{:02} {:02}:{:02}).\n"
-                          "; NOT VERIFIED. Restart the game to use it, then set Probe=0 in GyroUE\\GyroUE.ini.\n"
-                          "; If the camera still ignores the gyro, try the alternatives below one at a time (or delete "
-                          "this file).\n\n",
-                          GYROUE_VERSION, exe_stem, g_scored_diffs, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute)
-            : std::format("; GyroUE {} probe suggestion for {} ({} scored captures, {:04}-{:02}-{:02} {:02}:{:02}).\n"
-                          "; The game already has a profile ({}.ini), so this was written next to it. NOT VERIFIED.\n"
-                          "; To try it: rename this file to {}.ini (replacing the old one) and restart the game.\n"
-                          "; If the camera still ignores the gyro, try the alternatives below one at a time.\n\n",
-                          GYROUE_VERSION, exe_stem, g_scored_diffs, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute,
-                          exe_stem, exe_stem);
-    if (groups.empty()) {
+            ? std::format("; GyroUE {} profile for {}, created by the camera probe ({} scored captures, {}).\n", GYROUE_VERSION,
+                          exe_stem, g_scored_diffs, when)
+            : std::format("; GyroUE {} probe suggestion for {} ({} scored captures, {}).\n", GYROUE_VERSION, exe_stem,
+                          g_scored_diffs, when);
+    if (verified)
+        text += "; VERIFIED LIVE: the probe wrote small turns into this rotation and the camera followed them, twice.\n"
+                "; Restart the game to use it, then set Probe=0 in GyroUE\\GyroUE.ini.\n";
+    else
+        text += "; NOT VERIFIED: no rotation moved the camera in the live test (or it didn't run). This is only the\n"
+                "; best guess from the captures; it may well not work.\n";
+    if (!as_profile)
+        text += std::format("; To try it: rename this file to {}.ini (replacing the profile there, if any) and restart the game.\n",
+                            exe_stem);
+    text += "\n";
+    if (!best) {
         text += "; No usable rotation followed the camera in every capture. The camera may be driven by state the probe\n"
                 "; can't see (quaternions, input accumulators, animation). See ADVANCED.md, \"Finding the camera of a new game\".\n";
         summary = "no usable candidate";
     } else {
-        const Group& best = groups.front();
-        text += "[View.Default]\nLabel=Camera\n" + view_lines(best, "");
-        summary = best.object + (best.property.empty() ? std::format(" raw x{}", best.offsets.size()) : "." + best.property) +
-                  (best.world ? " (WorldRotation)" : "");
-        if (groups.size() > 1) {
-            text += "\n; Alternatives (also followed the camera):\n";
-            for (size_t i = 1; i < groups.size() && i < 8; ++i) text += view_lines(groups[i], ";   ") + ";\n";
-        }
+        text += "[View.Default]\nLabel=Camera\n" + view_lines(*best, "");
+        summary = best->object + (best->property.empty() ? std::format(" raw x{}", best->offsets.size()) : "." + best->property) +
+                  (best->world ? " (WorldRotation)" : "") + (verified ? ", verified live" : ", not verified");
     }
-    if (!ignored.empty()) {
-        text += "\n; Also followed the camera but ignored:\n";
-        for (size_t i = 0; i < ignored.size() && i < 12; ++i) {
-            const Candidate* c = ignored[i];
-            text += "  ; " + c->object + "(" + c->cls + ")" +
-                    (c->property.empty() ? std::format("+0x{:X}", c->offset) : "." + c->property) + ": " + c->why_not + "\n";
-        }
+    // Everything else that followed the camera, with what the live test (or the passive rules) said about it.
+    std::string others;
+    int listed = 0;
+    for (const ProbeGroup& g : groups) {
+        if (&g == best || ++listed > 16) continue;
+        others += "  ; " + g.object + "(" + g.cls + ")" +
+                  (g.property.empty() ? " raw " + [&] {
+                      std::string o;
+                      for (int32_t off : g.offsets) o += (o.empty() ? "" : ",") + std::format("0x{:X}", off);
+                      return o;
+                  }()
+                                      : "." + g.property) +
+                  ": " + result(g) + "\n";
     }
+    if (!others.empty()) text += "\n; Also followed the camera:\n" + others;
     return text;
 }
 

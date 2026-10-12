@@ -1,0 +1,31 @@
+#pragma once
+// The controller GyroLib reads through SDL (DualSense, Switch Pro, DirectInput/HID pads), shown to the game as an
+// Xbox (XInput) controller: the game's own imports of XInputGetState/SetState/GetCapabilities/Enable are redirected
+// (import-table hooks on game modules only, so SDL's own XInput use never sees it). For games that only support
+// XInput and run without Steam Input (e.g. Epic). Off when the game already reads the pad itself (see xinput.cpp).
+struct gl_context;
+struct gl_sdl;
+struct gl_output;
+struct SDL_Gamepad;
+
+namespace gyroue::xinput {
+
+enum Mode { Off = 0, Auto = 1, Always = 2 };
+
+struct Settings {
+    int mode = Auto;
+    bool nintendo_labels = false;  // swap face buttons A<->B and X<->Y (Nintendo A = Xbox A) instead of by position
+    bool touchpad_back = true;     // touchpad click also presses View (Back), like the Create/Share button
+};
+
+// DllMain, after hooks::init: registers the hooks the mode needs (none for Off).
+void install(const Settings& settings);
+
+// Game thread: the SDL gamepad of GyroLib's selected controller (GyroLib owns it), or null. Cached; any mode.
+SDL_Gamepad* selected_gamepad(gl_context* ctx, gl_sdl* reader, const gl_output& out);
+
+// Game thread, once per frame after the SDL reader was polled and gl_update ran (out is that update's output).
+// Updates the state the game reads and applies its rumble. Returns true while the pad is shown to the game.
+bool frame(gl_context* ctx, gl_sdl* reader, const gl_output& out);
+
+}  // namespace gyroue::xinput

@@ -4,6 +4,8 @@
 |---|---|
 | Nothing happens and there is no `GyroUE\GyroUE.log` | GyroUE isn't loading. Check it's next to the `-Win64-Shipping.exe` ([installation](README.md#install), step 2), then try renaming `winmm.dll` to `version.dll`. |
 | The camera doesn't move, but the log exists | Close DS4Windows/DSX/reWASD, plug the controller in by USB, check Steam Input. If a box at the top of the screen says **the game ignores the gyro**, the game needs a profile: see [Finding the camera of a new game](ADVANCED.md#finding-the-camera-of-a-new-game). |
+| The gyro works but the game ignores the controller's buttons and sticks | The game only supports Xbox controllers. Look for `xinput:` lines in `GyroUE.log`: they say why GyroUE didn't show the controller as an Xbox one. If the reason is wrong, set `XInput=2` in `GyroUE\GyroUE.ini` ([details](README.md#controllers-the-game-doesnt-support)). |
+| Every button acts twice, or the button icons keep switching | The game reads the controller itself and also gets GyroUE's Xbox controller. Set `XInput=0` in the game's profile or in `GyroUE\GyroUE.ini` (keeps the game's own DualSense support), or `XInput=1` if it is `2`, and report the game. |
 | The camera slowly drifts on its own | Put the controller on a table for a few seconds in a menu, or use **"Recalibrate gyro"** in the panel. |
 | The camera moves twice as much as it should | Steam Input (or another tool) is also turning the gyro into mouse movement. Turn that off. |
 | `F10` does nothing | Try it from the pause menu. DirectX 11 games have no panel: edit `GyroUE\gyrolib.ini` instead. |

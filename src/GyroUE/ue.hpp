@@ -68,14 +68,44 @@ bool write_number(Obj o, const char* name, double value);
 // Labels are profile paths ("Pawn.View(Class)"): the part before "(" works as Object=.
 size_t probe_snapshot(const std::vector<std::pair<std::string, Obj>>& roots);
 // Logs what changed since the snapshot (verbose: every changed value, as for F8) and scores the rotations
-// that now hold the camera's pitch and yaw. Returns the number of scored diffs so far (0 = not scored).
+// that followed the camera: they now hold its pitch and yaw, or changed by exactly the camera's turn (a rotation
+// kept with an offset or a small lag, e.g. Hogwarts Legacy's camera stack). Returns the number of scored diffs so
+// far (0 = not scored).
 int probe_diff(bool verbose);
-// Suggested profile (INI text) from the scored diffs, "" until there are at least two. summary = one-line pick.
+
+// Live test verdicts (the probe writes a small turn into a candidate and watches the camera).
+// kTurnsInPlace: it turned the view, but the camera didn't move the way the stick moves it (a third-person camera
+// orbits around the character; this one turned on the spot: a free camera, Hogwarts Legacy's camera component).
+enum ProbeVerdict { kUntested = 0, kMovesCamera = 1, kOverwritten = -1, kNoEffect = -2, kUntestable = -3, kInconsistent = -4,
+                    kTurnsInPlace = -5 };
+// Rotations that followed the camera in most scored diffs (at least two), one per object (all raw rotators of an object
+// together, as a profile writes them) or per reflected property. Usable ones first, then the ones the passive
+// rules call outputs (tested too: the live test decides).
+struct ProbeGroup {
+    std::string id;        // stable key for probe_verdict
+    std::string object;    // profile path ("ViewTarget.BehaviorStack")
+    std::string cls, property;
+    std::vector<int32_t> offsets;  // raw rotators (pitch, yaw, roll) when property is ""
+    int size = 0;          // 12 float / 24 double rotator
+    int hits = 0, exact = 0;  // scored diffs it followed / of which with the camera's exact values
+    bool world = false;    // RelativeRotation with absolute rotation: write with WorldRotation=1
+    std::string why_not;   // passive reason it looks like an output ("" = usable)
+    int verdict = kUntested;
+    std::string note;      // live test details
+};
+std::vector<ProbeGroup> probe_groups();
+void probe_verdict(const std::string& id, int verdict, const std::string& note);
+
+// Profile (INI text) from the scored diffs, "" until there are at least two. summary = one-line pick. A group
+// that moved the camera in the live test is picked first and the text says so (verified = true); otherwise the
+// pick is the passive best guess, marked NOT VERIFIED.
 // as_profile: the header for the game's own profile (the game had none), else for <exe>.suggested.ini.
-std::string probe_suggestion(const std::string& exe_stem, std::string& summary, bool as_profile);
+std::string probe_suggestion(const std::string& exe_stem, std::string& summary, bool as_profile, bool& verified);
 
 // The camera's final view rotation (PlayerCameraManager CameraCachePrivate.POV.Rotation).
 bool camera_pov(Obj camera, double& pitch, double& yaw);
+// The camera's final view location (...POV.Location), in world units.
+bool camera_pov_location(Obj camera, double location[3]);
 
 // Raw guarded reads
 bool read_ptr(uintptr_t address, uintptr_t& out);
