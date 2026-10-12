@@ -1,31 +1,37 @@
 # AGENTS.md
 
-This file provides guidance to AI code agnets when working with code in this repository.
+This file provides guidance to AI code agents when working with code in this repository.
 
 ## Project
 
-A universal gyro-aiming mod for PC games: DualSense (and other SDL-supported pads) motion sensors turn
-the in-game camera, with no per-game code in the common case. The plan:
+A gyro-aiming mod for Unreal Engine (UE4/UE5) games on PC: DualSense (and other SDL-supported pads) motion
+sensors turn the in-game camera, with no per-game code in the common case. How it works today:
 - gyro math and controller input come from **GyroLib** (https://github.com/lud-berthe/GyroLib, MIT;
   reviewed at v1.2.2, now pinned to **1.3.1** in `tools/gyrolib-sdk.sh`); we write the engine side;
-- the first engine is **Unreal (UE4/UE5)** via a **UE4SS C++ mod**, because every UE game shares the
-  reflected `APlayerController` camera path;
-- per-game differences (menus, ADS, vehicles, custom cameras) go in small per-game profiles, not code.
+- GyroUE is a **standalone system-DLL proxy** (`winmm.dll`, which also exports all of `version.dll` and can
+  be renamed to it) with its own Unreal reflection reader. It needs no UE4SS: UE4SS was only the loader of
+  the first prototype (MODLOG 2026-10-08) and is not used or shipped;
+- most UE games turn the camera through the reflected `PlayerController.ControlRotation`, so the generic
+  view needs no profile;
+- per-game differences (custom cameras, vehicles, auto-recentering) go in small per-game INI profiles
+  (`profiles/<exe stem>.ini`), not code. The camera probe (`Probe=1`) finds and writes them.
+- Only `ue.cpp` and the scene/view/probe parts of `host.cpp` know Unreal. The loader, hooks, GyroLib
+  wiring, XInput translation, native pad handling, overlay and notices are engine-neutral.
 
 Read these first:
-- `gyrolib-ue-review.md`: the feasibility review. Why GyroLib, what the UE side must supply, the main
-  obstacles and the first-prototype plan. Treat it as the design brief.
 - `MODLOG.md`: the running journal and the source of truth for paths, versions, signatures, findings and
   next steps. Record every new finding there (exact class, function, property and offset names), and
   record dead ends too.
+- `docs/ADVANCED.md`: how it works, the profile format, the camera probe ("Finding the camera of a new
+  game") and the log reference.
 
 ## Ground rules
 
 - Never commit or ship game files, extracted assets, decompiled output or GyroLib's build artifacts that
-  we didn't build. A release ships only our own code, GyroLib (with its MIT license) and UE4SS (with its
-  license).
-- Ask before installing loaders (UE4SS) into a game folder, editing game or registry settings, changing
-  Steam Input settings, or deleting anything. Back up saves first with `um backup create`.
+  we didn't build. A release ships only our own code (with MinHook linked in), GyroLib and their license
+  notices (`GyroUE\licenses\`).
+- Ask before installing GyroUE or any loader (e.g. UE4SS) into a game folder, editing game or registry
+  settings, changing Steam Input settings, or deleting anything. Back up saves first with `um backup create`.
 - Single-player / offline games without anti-cheat only (no EAC, BattlEye or kernel anti-cheat).
 - Don't present untested behaviour as working. "Builds" is not "works in game"; verify in game and say
   which pad, connection (USB/BT) and Steam Input state it was tested with.
@@ -33,38 +39,64 @@ Read these first:
   into code comments nor *.md files
 - Do not increase release version automatically. Ask for version to use if needed.
 
-## Architecture (target)
+## Architecture
 
 ```
-DualSense --HID--> SDL3 (inside gyrolib.dll, or its isolated reader process)
-          --> GyroLib: calibration, gravity fusion, gyro space, smoothing, curves,
-                       activation, views (Camera / ADS / Scope), FOV scaling
-          --> gl_update(now, host_state, &out) -> out.yaw_degrees / out.pitch_degrees
-          --> our UE4SS C++ mod, on the game thread (engine tick):
-                host_state  <- focus, IsGamePaused, bShowMouseCursor / input mode, pawn possessed
-                active view <- L2 past half travel (default) or per-game profile signal
-                FOV         <- PlayerCameraManager->GetFOVAngle()
-                apply       -> SetControlRotation(GetControlRotation() + delta)
-                               (or AddYawInput/AddPitchInput, scaled per UE version)
+DualSense --HID--> SDL3 (inside gyrolib.dll)
+          --> GyroLib: calibration, gravity fusion, gyro space, smoothing, curves, activation,
+                       views (contexts), flick stick, settings panel
+          --> gl_update(now, host_state, view) -> out.yaw_degrees / out.pitch_degrees
+          --> GyroUE (winmm.dll proxy), on the game thread once per frame (end of the PeekMessageW pump):
+                engine  <- GUObjectArray / FNamePool found by shape, reflection layout detected at runtime
+                scene   <- GEngine -> GameViewport -> World -> OwningGameInstance -> LocalPlayers[0]
+                           -> PlayerController, Pawn, PlayerCameraManager (view target, POV)
+                host    <- focus, WorldSettings pauser, bShowMouseCursor, no gameplay view (DefaultPawn)
+                view    <- the profile view whose ViewTargetClass matches the view target, else the default
+                apply   -> view rotation += delta, written in memory (default: PlayerController.ControlRotation;
+                           profiles: another reflected rotator, raw offsets, or WorldRotation=1)
 ```
 
-Key rules from the review:
-- All GyroLib calls on **one owner thread** (the game thread via the UE4SS tick callback). Create the
-  `gl_context` in `on_unreal_init`, never in `DllMain`.
+Key rules:
+- All GyroLib calls on **one owner thread**: the game thread, from the `PeekMessageW` hook (`dllmain.cpp`).
+  The `gl_context` is created lazily on the first frame (`host.cpp`, `start_gyro`), never in `DllMain`;
+  `DllMain` only registers hooks and reads (or creates) `GyroUE.ini` and the profile. Exception: the DX12
+  panel's render calls run on GyroUE's own render worker thread (`overlay.cpp`), because UE moves
+  `Present` between threads.
 - GyroLib output is already integrated degrees: don't multiply by dt.
-- UE4 `AddYawInput` multiplies by `InputYawScale` (2.5; pitch -2.5) and UE5 deprecated those scales.
-  Prefer `SetControlRotation`, which is true degrees on both.
+- Rotations are written straight into memory as degrees: float rotators in UE4, double in UE5 (the
+  property's element size says which). Not through `AddYawInput`/`AddPitchInput`: UE4 multiplies them by
+  `InputYawScale` (2.5; pitch -2.5) and UE5 deprecated those scales.
+- Every engine memory access is guarded (`ue.cpp`): a bad pointer returns "not found" instead of crashing
+  the game.
+- One GyroUE per install folder (session mutex): other exes in that folder that load the proxy stay plain
+  system-DLL proxies.
 - Steam Input may hide the physical pad or add its own gyro-to-mouse: test with it off and on, and watch
   for doubled motion.
 
-## Layout (planned)
+## Layout
 
-- `src/`: the UE4SS C++ mod (`GyroUE`), MSVC x64.
-- `profiles/`: per-game JSON (ADS/menu signals, apply method, sensitivity defaults).
-- `games/<Game>/`: per-game notes, deploy and package scripts, UE4SS config.
-- `third_party/`: GyroLib and UE4SS sources or pinned releases (not committed if large; note versions in
-  MODLOG).
+- `src/GyroUE/`: the mod, MSVC x64, CMake.
+  - `dllmain.cpp`: entry point and the per-frame `PeekMessageW` hook. `proxy.cpp`/`proxy.def`: forwarding
+    to the System32 DLL with the proxy's own name (`winmm.dll` or `version.dll`).
+  - `hooks.cpp`: import-table hooks (regular and delay-load) on the game modules (exe plus
+    `<Project>-*.dll` of modular builds); inline MinHook hooks for protected exes.
+  - `host.cpp`: the per-frame logic: GyroLib, scene, views and profiles, camera probe and live test,
+    follow check.
+  - `ue.cpp`: Unreal memory layout and reflection, and the probe's snapshot/diff.
+  - `xinput.cpp`: the SDL controller shown to the game as XInput. `nativepad.cpp`: the game's own
+    PlayStation pad access (Sony's pad library), for `XInput=2` and native flick stick.
+  - `overlay.cpp`: GyroLib's DX12 settings panel. `notify.cpp`: on-screen notices (GDI). `deps.cpp`:
+    Visual C++ runtime check before loading GyroLib. `log.cpp`, `perf.cpp`.
+- `profiles/`: per-game INI profiles, `<exe stem>.ini` (format in `docs/ADVANCED.md`, "Game profiles").
+- `docs/`: user documentation, shipped in the release zip.
+- `games/<Game>/`: per-game notes and scripts (git-ignored).
+- `third_party/`: the GyroLib SDK and MinHook (git-ignored; versions in MODLOG).
+- `tools/`: build, package, deploy, benchmark and test tools (see Tooling).
+- `bench/`: benchmark method and results.
 - `build/release/`: installable release zips, `GyroUE-v<version>.zip` (git-ignored, like all of `build/`).
+- In a game's `Binaries\Win64`: `winmm.dll` (or `version.dll`) and `GyroUE\` with `gyrolib.dll`,
+  `profiles\`, `GyroUE.ini` (mod settings) and `gyrolib.ini` (GyroLib settings), both created on first run,
+  and the logs (`GyroUE.log`, `GyroUE-probe.log`).
 
 ## Tooling
 
