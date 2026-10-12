@@ -132,14 +132,16 @@ doesn't follow the gyro, GyroUE tells you on screen, and [Advanced](docs/ADVANCE
 |---|---|---|
 | Pacific Drive | ✅ Works | Gyro on foot **and** in the car. |
 | Returnal | ✅ Works | Tip: in the settings panel, set the gyro to work only while L2/R2 is held. |
-| Cronos: The New Dawn | ✅ Works | Settings panel also works with HDR mods (RenoDX). |
+| Cronos: The New Dawn | ✅ Works | |
 | Life is Strange Remastered | ✅ Works | **No `F10` panel** in this game: change settings in `gyrolib.ini` (see [Using it](#using-it)). |
 | Luto | ✅ Works | |
 | Out of sight | ✅ Works | |
-| Terminator: resistance | ✅ Works | |
+| Terminator: resistance | ✅ Works | **No `F10` panel** in this game: change settings in `gyrolib.ini` (see [Using it](#using-it)). |
 | The Outer Worlds: Spacer's Choice Edition | ✅ Works | Native DualSense support: GyroUE leaves the controller to the game. |
 | Severed Steel | ✅ Works (tested on the demo) | **No `F10` panel** (DX11). Rename `MSVCP140.dll` and `MSVCP140_2.dll` in its `Binaries\Win64` folder (e.g. to `.bak`): it ships an old VC++ runtime that GyroLib can't use. Until you do, GyroUE leaves the gyro off and tells you so on screen. |
 | Gears of War: E-Day (Game Pass) | ⚠️ Campaign only, **with EasyAntiCheat disabled** | Install in `Binaries\WinGDK`. The gyro starts a few seconds after the main menu appears. Never play online with it. |
+| The Outer Worlds: Spacer's Choice Edition | ✅ Works | |
+| Hogwart's Legacy | ✅ Works | |
 
 
 
