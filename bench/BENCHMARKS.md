@@ -1,7 +1,7 @@
 # GyroUE performance and benchmarks
 
 Everything about GyroUE's performance cost: tools, method, results and optimisation analysis.
-Project context: `../CLAUDE.md`; functional history: `../MODLOG.md`.
+Project context: `../AGENTS.md`; functional history: `../MODLOG.md`.
 
 **Status (2026-10-08): closed.** No measurable FPS/frametime cost in Returnal (GPU-bound); ~110 µs of game
 thread per rendered frame. No optimisation work is planned. Reopen only if a CPU-bound game shows a cost, starting

@@ -26,7 +26,7 @@ play.
   live while the game runs. GyroUE declares `GL_HOST_MENU_STATE` to GyroLib, plus native right-stick
   suppression while it translates the controller to XInput or while the game reads a PlayStation controller itself
   through a checked report layout (`NativeFlickStick`): no touchpad suppression, no long-press blocking and
-  no recenter callback (see [Current scope](README.md#current-scope)).
+  no recenter callback (see [Current scope](../README.md#current-scope)).
 - **Coexists with ReShade, RenoDX (HDR) and the Steam overlay.** Panel rendering runs on GyroUE's own
   thread, so it keeps working when the engine moves `Present`/`ResizeBuffers` between threads.
 - **Diagnostics for new games:** a status line every 10 s in `GyroUE.log`, plus an optional probe (`F7`
@@ -43,6 +43,8 @@ play.
 | Life is Strange Remastered | UE 4 (pre-4.25 property system), DX11 | yes (shipped) | Found with the camera probe. The camera splits pitch and yaw across two raw rotators, and the walking camera blends back to an automatic follow camera unless it gets look input; the profile writes `OnGyro=` to keep it manual. No settings panel (DX11): configure via `gyrolib.ini`. |
 | Luto | UE 5.5.4 | no | Generic path working OOB. Only reads XInput: GyroUE shows the DualSense / Switch Pro as an Xbox controller (Epic, no Steam Input). |
 | The Outer Worlds: Spacer's Choice Edition | UE 4 | no | Generic path. Native DualSense (delay-loaded `libScePad.dll`): XInput translation stays off. |
+| Hogwart's Legacy | UE 4 | yes | Third person detached camera, new objects detected. Native DualSense (delay-loaded `libScePad.dll`): XInput translation stays off. |
+
 
 Tested with a DualSense over USB/BT and Nintendo Switch Pro Controller. Requirements and limits:
 
@@ -139,7 +141,7 @@ DualSense --HID--> SDL3 (inside gyrolib.dll)
 ## Game profiles
 
 The generic path needs no profile. When a game's camera ignores `ControlRotation`, add
-`GyroUE\profiles\<exe name without .exe>.ini`. Profiles shipped in this repo live in [`profiles/`](profiles).
+`GyroUE\profiles\<exe name without .exe>.ini`. Profiles shipped in this repo live in [`profiles/`](../profiles).
 
 ```ini
 [GyroUE]
@@ -465,6 +467,7 @@ Repository layout:
 | `games/<Game>/` | Per-game notes and scripts |
 | `tools/` | Build, deploy and benchmark scripts; `gyroprobe` sensor test tool |
 | `bench/` | Performance measurements |
+| `docs/` | User documentation: this file, `TROUBLESHOOTING.md`, `CREDITS.md` |
 | `MODLOG.md` | Development journal: findings, offsets, dead ends |
 
 From a source checkout, `tools/deploy-gyroue.sh` installs into a game (`remove` as a second argument
@@ -478,4 +481,4 @@ bash tools/deploy-gyroue.sh "D:/Games/MyGame/MyGame/Binaries/Win64"
 
 GyroUE's per-frame work is roughly 50–100 µs on the game thread, plus 15–40 µs in the `Present` hook while the
 panel is closed. Benchmarks in Returnal showed no measurable FPS or frametime change. See
-[`bench/BENCHMARKS.md`](bench/BENCHMARKS.md).
+[`bench/BENCHMARKS.md`](../bench/BENCHMARKS.md).

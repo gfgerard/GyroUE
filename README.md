@@ -19,15 +19,15 @@ No Steam Input (although compatible if the game needs it), no mouse emulation, n
 
 - [Installation / uninstall / update](#installation--uninstall--update)
 - [Using it](#using-it)
-- [Controllers the game doesn't support](#controllers-the-game-doesnt-support)
+- [Controllers the game doesn't support (universal controller support)](#controllers-the-game-doesnt-support)
 - [Supported games](#supported-games)
 - [Current scope](#current-scope): what GyroUE does and doesn't do (yet)
 
 More:
 
-- [Problems?](TROUBLESHOOTING.md): common problems and how to report one
-- [Advanced](ADVANCED.md): technical details, game profiles, adding [support for a new game](ADVANCED.md#finding-the-camera-of-a-new-game), building from source
-- [Credits and licenses](CREDITS.md)
+- [Problems?](docs/TROUBLESHOOTING.md): common problems and how to report one
+- [Advanced](docs/ADVANCED.md): technical details, game profiles, adding [support for a new game](docs/ADVANCED.md#finding-the-camera-of-a-new-game), building from source
+- [Credits and licenses](docs/CREDITS.md)
 
 **What you need**
 
@@ -85,8 +85,7 @@ changed.
 
 ## Using it
 
-- **The gyro is on during gameplay** and pauses by itself in menus, the pause screen, the main menu and when
-  you alt-tab.
+- **Gyro is on during gameplay** and pauses by itself in menus, the pause screen, the main menu and when you alt-tab.
 - **Settings panel: press `F10`** (some games only accept it from the pause menu). Change sensitivity,
   how the gyro activates (always on, hold a button or trigger, toggle), invert axes, smoothing, acceleration
   curves and more. Games with several cameras (e.g. on foot / in car) get one tab each. Settings are saved
@@ -97,12 +96,13 @@ changed.
 - **No panel?** (DirectX 11 games such as Life is Strange) Open `GyroUE\gyrolib.ini` with Notepad while the game
   runs and save: changes apply within a second. Every setting is explained in GyroLib's
   [settings reference](https://github.com/lud-berthe/GyroLib).
+- No gyro-camera movement after installation? see [add support for a new game](docs/ADVANCED.md#finding-the-camera-of-a-new-game) or [ask for a profile for it](https://github.com/gfgerard/GyroUE/issues)
 
 ### Controllers the game doesn't support
 
 > [!NOTE]
-> version >= 0.8.0: Tested with a DualSense and a Switch Pro controller (Bluetooth).
-> Without Steam Input or a remmaper you can play any game automatically emulating XInput if needed.
+> **version >=0.8.0**: Without Steam Input or a remmaper you can play any game ^GyroUE automatically emulates XInput if needed.
+> Tested with a DualSense and a Switch Pro controller (Bluetooth).
 
 Many PC games only understand Xbox controllers (XInput). Without Steam Input/xbox emulation (e.g. games from the Epic Games Store)
 a DualSense, a Switch Pro controller or a DirectInput pad then does nothing in the game, except for GyroUE's gyro.
@@ -126,7 +126,7 @@ GyroUE can **show your controller to the game as an Xbox controller**: buttons, 
 
 > [!TIP]
 > **Your game isn't listed?** Most Unreal Engine 4/5 games work without any setup: just try it. If the camera
-doesn't follow the gyro, GyroUE tells you on screen, and [Advanced](ADVANCED.md#finding-the-camera-of-a-new-game) explains how to add support.
+doesn't follow the gyro, GyroUE tells you on screen, and [Advanced](docs/ADVANCED.md#finding-the-camera-of-a-new-game) explains how to add support.
 
 | Game | Status | What to know |
 |---|---|---|
@@ -155,7 +155,7 @@ GyroUE doesn't implement them yet:
 | Gyro camera with calibration, smoothing, curves and an activation button | ✅ | The core of the mod. |
 | Separate settings per camera (e.g. on foot / in car) | ✅ | Needs a game profile (shipped for the supported games). |
 | Settings panel (`F10`) | ✅ DirectX 12 only | The panel needs rendering and window integration, which GyroUE has for DX12 only. DX11 games: edit `gyrolib.ini`. |
-| Flick stick | ⚠️ While GyroUE shows the controller as an Xbox one (**XInput=2** to force it), and (experimental) in games with their own PlayStation controller support | Needs the game's own right-stick rotation suppressed. GyroUE can do that for the controller it translates to XInput ([see above](#controllers-the-game-doesnt-support)), and for a DualSense/DualShock 4 the game reads itself through Sony's pad library (`NativeFlickStick=1`, off by default, with `XInput=1`: the game keeps PlayStation icons, haptics and adaptive triggers; the flick options appear after you move the right stick once in game). Otherwise GyroLib's panel hides the flick options, and the `context.N.flick.*` keys in `gyrolib.ini` are just stored preferences, don't edit them by hand. |
+| Flick stick | ✅ In Xinput mode (auto / **XInput=2** to force it), and (⚠️ experimental) in games with their own PlayStation controller support | Needs the game's own right-stick rotation suppressed. GyroUE can do that for the controller it translates to XInput ([see above](#controllers-the-game-doesnt-support)), and for a DualSense/DualShock 4 the game reads itself through Sony's pad library (`NativeFlickStick=1`, off by default, with `XInput=1`: the game keeps PlayStation icons, haptics and adaptive triggers; the flick options appear after you move the right stick once in game). Otherwise GyroLib's panel hides the flick options, and the `context.N.flick.*` keys in `gyrolib.ini` are just stored preferences, don't edit them by hand. |
 | Gyro button that doesn't also act in the game | ❌ | GyroUE doesn't filter the game's input (no long-press blocking). A button used to hold or toggle the gyro still does its normal action in the game: pick one the game doesn't need. |
 | Camera recenter button | ❌ | Needs the mod to recenter the game's camera on request (a host callback). |
 | Different sensitivity when aiming down sights or scoped | ❌ | GyroUE doesn't detect aiming. Camera settings only change between profile views (e.g. a vehicle). |

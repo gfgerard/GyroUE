@@ -28,8 +28,10 @@ cp "$SDK/share/doc/GyroLib/licenses/"* "$STAGE/GyroUE/licenses/"
 cp "$SDK/share/doc/GyroLib/sdl-changes/README-GyroLib.md" "$STAGE/GyroUE/licenses/SDL-CHANGES.md"
 cp "$ROOT/LICENSE.txt" "$STAGE/GyroUE/licenses/GyroUE-LICENSE.txt"
 cp "$ROOT/third_party/minhook-1.3.4/LICENSE.txt" "$STAGE/GyroUE/licenses/MinHook-LICENSE.txt"  # linked into winmm.dll
-# Together in one folder, so the links between them keep working.
-for doc in README TROUBLESHOOTING ADVANCED CREDITS; do cp "$ROOT/$doc.md" "$STAGE/GyroUE/readme/$doc.md"; done
+# Same layout as the repository (README.md beside docs/), so the links between them keep working.
+mkdir -p "$STAGE/GyroUE/readme/docs"
+cp "$ROOT/README.md" "$STAGE/GyroUE/readme/README.md"
+for doc in TROUBLESHOOTING ADVANCED CREDITS; do cp "$ROOT/docs/$doc.md" "$STAGE/GyroUE/readme/docs/$doc.md"; done
 
 # Python's zipfile writes forward-slash paths (PowerShell 5.1's Compress-Archive writes backslashes).
 python -I - "$(cygpath -w "$STAGE")" "$(cygpath -w "$OUT/$NAME.zip")" <<'EOF'

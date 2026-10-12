@@ -1,6 +1,6 @@
 # GyroUE: credits and third-party licenses
 
-GyroUE is released under the [MIT License](LICENSE.txt).
+GyroUE is released under the [MIT License](../LICENSE.txt).
 
 ## GyroLib
 
