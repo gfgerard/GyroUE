@@ -129,6 +129,10 @@ uintptr_t g_obj_array = 0;   // TUObjectArray: Objects**, PreAllocated*, Max, Nu
 int g_item_stride = 0;       // sizeof(FUObjectItem)
 uintptr_t g_name_blocks = 0; // FNamePool Blocks[]
 bool g_header_len_high = true;  // FNameEntryHeader: Len in bits 6..15 (true) or 0..9
+// UE <= 4.22 has no FNamePool: TNameEntryArray (GNames) holds Chunks[128] of FNameEntry*[16384], then NumElements,
+// NumChunks. FNameEntry: Index (name index << 1 | wide), HashNext, then the NUL-terminated characters.
+uintptr_t g_name_chunks = 0;    // TNameEntryArray::Chunks
+int g_name_text = 0x10;         // offset of the characters in an FNameEntry
 
 int g_super = -1;        // UStruct::SuperStruct
 int g_child_props = -1;  // UStruct::ChildProperties
@@ -148,7 +152,45 @@ std::map<std::pair<uintptr_t, std::string>, Prop> g_props;
 
 // ---------------------------------------------------------------- names
 
+// A NUL-terminated string of up to 1024 characters, read in small pieces so a string near the end of a page
+// still reads.
+template <class Char>
+bool read_cstring(uintptr_t address, std::basic_string<Char>& out) {
+    Char piece[16];
+    while (out.size() < 1024) {
+        if (!guarded_copy(piece, address, sizeof(piece))) {
+            // The rest of the piece may be unmapped: one character at a time.
+            if (!guarded_copy(piece, address, sizeof(Char))) return false;
+            if (!piece[0]) return !out.empty();
+            out += piece[0];
+            address += sizeof(Char);
+            continue;
+        }
+        for (Char c : piece) {
+            if (!c) return !out.empty();
+            out += c;
+        }
+        address += sizeof(piece);
+    }
+    return false;
+}
+
+std::string legacy_entry_string(uint32_t index) {
+    if (index >= 128 * 16384) return {};
+    const uintptr_t chunk = rdp(g_name_chunks + (index / 16384) * 8ull);
+    const uintptr_t entry = chunk ? rdp(chunk + (index % 16384) * 8ull) : 0;
+    int32_t entry_index = 0;
+    if (!entry || !rd(entry, entry_index)) return {};
+    if (!(entry_index & 1)) {
+        std::string s;
+        return read_cstring(entry + g_name_text, s) ? s : std::string{};
+    }
+    std::wstring w;
+    return read_cstring(entry + g_name_text, w) ? narrow(w) : std::string{};
+}
+
 std::string entry_string(uint32_t index) {
+    if (g_name_chunks) return legacy_entry_string(index);
     const uint32_t block = index >> 16, offset = (index & 0xFFFF) * 2;
     if (block >= 8192) return {};
     const uintptr_t base = rdp(g_name_blocks + block * 8ull, 2);
@@ -461,6 +503,38 @@ bool find_name_pool(const std::vector<Range>& sections) {
     return false;
 }
 
+// TNameEntryArray (UE <= 4.22) at `chunks`: names 0 and 1 are None and ByteProperty, NumElements/NumChunks follow
+// the 128 chunk pointers. Sets the characters' offset in an entry.
+bool legacy_names_at(uintptr_t chunks) {
+    const uintptr_t chunk0 = rdp(chunks);
+    if (!chunk0) return false;
+    const uintptr_t e0 = rdp(chunk0), e1 = rdp(chunk0 + 8);
+    if (!e0 || !e1) return false;
+    int32_t num = 0, num_chunks = 0;
+    if (!rd(chunks + 128 * 8, num) || !rd(chunks + 128 * 8 + 4, num_chunks)) return false;
+    if (num <= 1000 || num > 128 * 16384 || num_chunks < (num + 16383) / 16384 || num_chunks > 128) return false;
+    for (int off : {0x10, 0x0C, 0x08, 0x14, 0x18}) {
+        char a[5] = {}, b[13] = {};
+        if (!guarded_copy(a, e0 + off, sizeof(a)) || !guarded_copy(b, e1 + off, sizeof(b))) continue;
+        if (std::memcmp(a, "None", 5) != 0 || std::memcmp(b, "ByteProperty", 13) != 0) continue;
+        g_name_text = off;
+        return true;
+    }
+    return false;
+}
+
+// GNames: a global TNameEntryArray, or (stock 4.21/4.22) a global pointer to a heap one.
+bool find_legacy_names(const std::vector<Range>& sections) {
+    for (const Range& r : sections) {
+        for (uintptr_t a = r.begin; a + 128 * 8 + 8 <= r.end; a += 8) {
+            if (legacy_names_at(a)) return g_name_chunks = a, true;
+            const uintptr_t p = rdp(a);
+            if (p && legacy_names_at(p)) return g_name_chunks = p, true;
+        }
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------- reflection layout
 
 std::string field_name(uintptr_t field) { return fname(field + g_field_name); }
@@ -663,7 +737,12 @@ bool init() {
     if (!g_name_blocks && find_name_pool(sections))
         log("ue: FNamePool.Blocks at %s (header len %s)", module_offset(g_name_blocks).c_str(),
             g_header_len_high ? "high bits" : "low bits");
-    if (!g_obj_array || !g_name_blocks) return false;
+    // UE <= 4.22: no pool, the older name table. Only once the objects are found, so a pool that a later try
+    // would find (4.23+) isn't passed over.
+    if (!g_name_blocks && !g_name_chunks && g_obj_array && find_legacy_names(sections))
+        log("ue: no FNamePool; GNames (TNameEntryArray, UE 4.22 or older) chunks at %s, characters at entry +0x%X",
+            module_offset(g_name_chunks).c_str(), g_name_text);
+    if (!g_obj_array || (!g_name_blocks && !g_name_chunks)) return false;
     if (!detect_layout()) {
         g_next_try = now + 5000;
         g_class_class = 0;
@@ -730,6 +809,16 @@ Prop find_prop(Obj cls, const char* name) {
     const auto key = std::make_pair(cls, std::string(name));
     if (auto it = g_props.find(key); it != g_props.end()) return it->second;
     Prop p;
+    // "Struct.Member" (any depth): a property nested in struct properties, at the sum of their offsets
+    // (Jedi: Fallen Order's RsCameraManager ModeOutputs.Rotation). Found by reflection, so it survives game updates.
+    if (const char* dot = std::strchr(name, '.')) {
+        const Prop outer = find_prop(cls, std::string(name, dot).c_str());
+        const Obj st = outer && outer.type == "StructProperty" ? struct_type(outer) : 0;
+        const Prop inner = st ? find_prop(st, dot + 1) : Prop{};
+        if (inner) p = inner, p.offset += outer.offset;
+        g_props.emplace(key, p);
+        return p;
+    }
     Obj c = cls;
     for (int depth = 0; c && depth < 64 && !p.field; ++depth) {
         if (uintptr_t f = find_field(rdp(c + g_child_props), g_field_next, g_field_name, name)) {
@@ -1375,7 +1464,12 @@ int probe_diff(bool verbose) {
         Candidate c;
         split_label(l.label, c.object, c.cls, c.property);
         c.size = l.kind == 2 ? 12 : 24;
-        if (c.object.rfind("Camera", 0) == 0) c.why_not = "camera output";
+        // The camera manager is mostly output (POV caches), but a game's own subclass may keep its look state past the
+        // engine's PlayerCameraManager part, also in a struct (Jedi: Fallen Order's RsCameraManager ModeOutputs.Rotation,
+        // usable as Property=ModeOutputs.Rotation), as for raw offsets below.
+        const int32_t camera_engine = c.object == "Camera" ? engine_part_size(l.obj, "PlayerCameraManager") : 0;
+        if (c.object.rfind("Camera", 0) == 0 && !(camera_engine > 0 && l.address >= l.obj + camera_engine))
+            c.why_not = "camera output";
         else if (c.property == "RelativeRotation" && read_obj(l.obj, "AttachParent") &&
                  has_world_rotation(l.obj, prop_of(l.obj, "RelativeRotation"))) {
             // An attached component with absolute rotation: the game sets its world rotation itself, so it may be the
@@ -1384,7 +1478,6 @@ int probe_diff(bool verbose) {
             c.camera = is_a(l.obj, "CameraComponent");
         } else if (c.property.find("RelativeRotation") != std::string::npos) c.why_not = "component transform (output)";
         else if (c.object == "PC" && c.property == "ControlRotation") c.why_not = "the default view (already tried)";
-        else if (c.property.find('.') != std::string::npos) c.why_not = "nested in a struct (not usable as Property=)";
         score(c.object + "|" + c.property, c, seen, exact);
         ++found;
         if (!verbose)
@@ -1511,7 +1604,7 @@ std::string probe_suggestion(const std::string& exe_stem, std::string& summary, 
         }
     if (!best)
         for (const ProbeGroup& g : groups)
-            if (g.why_not.empty() && g.verdict == kUntested && (g.property.empty() || g.property.find('.') == std::string::npos)) {
+            if (g.why_not.empty() && g.verdict == kUntested) {
                 best = &g;
                 break;
             }
@@ -1547,7 +1640,7 @@ std::string probe_suggestion(const std::string& exe_stem, std::string& summary, 
                           g_scored_diffs, when);
     if (verified)
         text += "; VERIFIED LIVE: the probe wrote small turns into this rotation and the camera followed them, twice.\n"
-                "; Restart the game to use it, then set Probe=0 in GyroUE\\GyroUE.ini.\n";
+                "; GyroUE set Probe=0 in GyroUE\\GyroUE.ini when it wrote this: restart the game to use it.\n";
     else
         text += "; NOT VERIFIED: no rotation moved the camera in the live test (or it didn't run). This is only the\n"
                 "; best guess from the captures; it may well not work.\n";

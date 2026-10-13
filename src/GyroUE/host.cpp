@@ -204,8 +204,8 @@ std::string probe_header() {
            "     then stop. GyroUE captures the turn by itself (turns without the stick, e.g. cutscenes, are ignored).\n"
            "  3. Repeat 3 or 4 times. From the second capture on, the game's profile is written to\n"
            "     GyroUE\\profiles\\<game>.ini, or to <game>.suggested.ini if the game already had a profile\n"
-           "     (and copied at the end of this file). Restart the game to use it; set Probe=0 in GyroUE\\GyroUE.ini\n"
-           "     once the camera works.\n"
+           "     (and copied at the end of this file). Once a camera is verified live, GyroUE sets Probe=0 in\n"
+           "     GyroUE\\GyroUE.ini by itself: restart the game and the gyro turns the camera.\n"
            "  Manual alternative: F7 = snapshot, turn with the stick, F8 = diff (pressing F7/F8 turns the automatic\n"
            "  capture off for the session).\n"
            "\n"
@@ -228,7 +228,7 @@ const char kDefaultSettings[] =
     "; 1 = find the camera of a game whose camera ignores the gyro: in gameplay, turn the camera with the\r\n"
     ";     RIGHT STICK (more than 30 degrees) and stop, 3-4 times (the gyro is paused meanwhile). GyroUE then writes the game's\r\n"
     ";     profile (GyroUE\\profiles\\<game exe>.ini, or <game exe>.suggested.ini if the game already has one).\r\n"
-    ";     Set it back to 0 once the camera works. Results: GyroUE\\GyroUE-probe.log.\r\n"
+    ";     Once a camera is verified, GyroUE sets this back to 0 by itself. Results: GyroUE\\GyroUE-probe.log.\r\n"
     "Probe=0\r\n"
     "; 0 = no on-screen notices (they still go to GyroUE.log).\r\n"
     "Notices=1\r\n"
@@ -857,6 +857,17 @@ bool start_tests() {
     return true;
 }
 
+// After a verified camera the probe's job is done: Probe=0 in GyroUE.ini (and in the game's profile, if it sets
+// Probe itself), so the next start doesn't keep the gyro paused for another probe run.
+bool disable_probe() {
+    bool ok = WritePrivateProfileStringW(L"GyroUE", L"Probe", L"0", g_settings_path.c_str()) != 0;
+    wchar_t value[8];
+    if (GetPrivateProfileStringW(L"GyroUE", L"Probe", L"", value, 8, g_profile_path.c_str()) > 0)
+        ok = WritePrivateProfileStringW(L"GyroUE", L"Probe", L"0", g_profile_path.c_str()) != 0 && ok;
+    log("probe: %s", ok ? "Probe=0 written (the probe won't run on the next start)" : "couldn't write Probe=0, set it by hand");
+    return ok;
+}
+
 void finish_tests() {
     g_test.phase = LiveTest::Off;
     bool usable = false, verified = false;
@@ -865,11 +876,14 @@ void finish_tests() {
     if (verified) {
         g_auto.done = true;
         log("probe: done, a rotation moved the camera in both rounds of the live test");
+        const bool off = written != Written::Nothing && disable_probe();
+        const std::wstring probe_off = off ? L"The probe is now off (Probe=0)." : L"Then set Probe=0 in GyroUE\\GyroUE.ini.";
         notify::show(written == Written::Profile
-                         ? L"GyroUE probe: camera found and VERIFIED live.\nProfile created: " + file +
-                               L"\nRestart the game to use it, then set Probe=0 in GyroUE\\GyroUE.ini."
-                         : L"GyroUE probe: camera found and VERIFIED live.\nThis game already has a profile, so it went to " +
-                               file + L"\nRename it to " + g_exe_stem + L".ini (replacing the old one) and restart.",
+                         ? L"GyroUE: camera found and VERIFIED, profile created.\nRESTART THE GAME: the gyro will then "
+                           L"turn the camera.\n" + probe_off
+                         : L"GyroUE: camera found and VERIFIED.\nThis game already has a profile, so it went to " + file +
+                               L"\nRename it to " + g_exe_stem + L".ini (replacing the old one), then RESTART THE GAME: "
+                               L"the gyro will then turn the camera.\n" + probe_off,
                      30);
         return;
     }
@@ -926,7 +940,6 @@ void run_live_test(const Scene& s, bool valid, ULONGLONG still_for) {
         }
         if (in_phase < 250) return;
         const ue::ProbeGroup& g = g_test.queue[g_test.index];
-        if (g.property.find('.') != std::string::npos) return test_result(ue::kUntestable, "nested in a struct");
         g_test.view = test_view(g);
         double p0 = 0;
         if (!read_view_rotation(g_test.view, s, p0, g_test.val_y))

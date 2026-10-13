@@ -1202,6 +1202,12 @@ or gyro to stick.
     views (no `[View.Default]`, no `Views`) doesn't count as an existing profile for it.
   - DualSense handles are now always followed (read hooks always installed), to see whether the game reads them.
 
+- 2026-10-13 **Build: GyroUE 0.8.1** (version chosen by the user), `build/release/GyroUE-v0.8.1.zip`. Since 0.8.0:
+  DualSense shown as a DualShock 4 to games whose Sony library only knows the DS4 (USB and Bluetooth), learned
+  automatically and saved in the game's profile (notice: restart); Mortal Shell profile; auto mode translates non-Sony
+  controllers (Switch Pro, DirectInput) also in games with a Sony library; GyroUE takes back XInput imports an overlay
+  rewrites (Epic Online Services overlay in Mortal Shell); diagnostics `XInputTrace=1` and `input:` log lines.
+
 ## Status summary (2026-10-08)
 - Pacific Drive: **done** (on foot + car profile, in-game panel, calibration). Install:
   `games/PacificDrive/deploy-gyroue.sh "<Win64 dir>"`; uninstall with `remove`. UE4SS is parked as `dwmapi.dll.off`.
@@ -1258,6 +1264,69 @@ or gyro to stick.
     pacer (tested with a test build of this change; an existing `Pacing=1` line in GyroUE.ini is ignored).
   - **Still to test:** Switch Pro over USB, DualSense over USB and BT (the status-line P% must stay ~0, see the latch
     risk above), Steam Input on, and a `MotionTrace=1` capture for `tools/motion_trace_report.py`.
+
+- 2026-10-13 **Jedi: Fallen Order (Steam, UE 4.21, exe `SwGame-Win64-Shipping.exe`, UE4SS also installed), GyroUE 0.8.1:
+  engine not readable.** GUObjectArray found (`ObjObjects` at exe+0x3875CE0, stride 0x18, ~26.8k objects) but no
+  `FNamePool` line ever, `view=none` all session and the 60 s "engine data can't be read" notice. Root cause: the pool
+  only exists from UE 4.23; 4.21/4.22 keep names in **`TNameEntryArray` (GNames)**: `Chunks[128]` of
+  `FNameEntry*[16384]`, then `NumElements`, `NumChunks`; `FNameEntry` = `Index` (name index << 1 | wide), `HashNext`,
+  characters (NUL-terminated) at +0x10. Not the Hogwarts issue (there a false pool was taken; here there is none).
+  - Fix (`ue.cpp`, `find_legacy_names`/`legacy_entry_string`): when the pool isn't found and the object array is,
+    look in the exe's writable sections for GNames (a pointer to the table, or the table itself): entries 0/1 must read
+    `None` and `ByteProperty` at the same text offset (tried 0x10, 0x0C, 0x08, 0x14, 0x18), and NumElements/NumChunks
+    must be consistent. Logs `ue: no FNamePool; GNames (TNameEntryArray, ...)`. Properties are `UProperty` objects
+    there, already handled (`g_field_class_name`, as for Life is Strange Remastered).
+  - Built (no version bump), **not tested in game yet**: the reflection layout detection on 4.21 is the next unknown.
+  - **Tested (user, DualSense BT): engine readable.** `GNames ... characters at entry +0x10`, layout `UProperty
+    objects, UE <= 4.24` SuperStruct=0x30 ChildProperties=0x38 Field.Class=0x10 Field.Next=0x28 Field.Name=0x18
+    ElementSize=0x34 Offset_Internal=0x44 sizeof(Property)=0x70; PC `BP_SwPlayerController_C` (ControlRotation +0x3C8),
+    pawn `BP_Hero_C`, camera manager **`RsCameraManager`**, view target the pawn. The gyro wrote ControlRotation (296
+    degrees) and the camera didn't move. Probe (8 captures): ControlRotation overwritten (output),
+    `PC.TransformComponent0` RelativeRotation and raw 0x260/0x280 kept without effect,
+    `Camera.ModeOutputs.Rotation` (offset from the POV) and `CameraCachePrivate.POV.Rotation` "not testable: nested in
+    a struct". Orbit radius ~380.
+  - **Read-only memory hunt** (scratch script, PC/pawn/camera manager + two pointer levels, 2308 blocks, 12 rests
+    between stick turns; also unit quaternions and 2D direction vectors): only exact copies of the POV
+    (ControlRotation, camera manager +0x19FC/+0x1F6C = POV caches, TransformComponent0, view matrices, a native
+    struct pointed to by PC+0x6D0 at +0x174). The hunt read only 0x2000 bytes of the camera manager, which missed
+    ModeOutputs.
+  - Reflection of `RsCameraManager`: `ActiveCameraMode` +0x2600 (`RsCameraMode`: ModeName, MotionParms, Aliases,
+    Behaviors; no state of its own), `ModeInputs` +0x2610 (AnchorLocation/AnchorRotation, ControllerInput +0x2704,
+    MouseInput, ...), **`ModeOutputs` +0x2740** (Location +0x2740, **Rotation +0x274C**, LocationOffsetCS (arm, about
+    -450 X), RotationOffsetWS +0x278C (pitch -4: POV = ModeOutputs.Rotation + this)). The unreflected region after
+    `ActiveSplineCameraModeName` (+0x2D18..+0x3498) holds no copy of the camera angles.
+  - **Write proof (`WriteProcessMemory`, user agreed):** +30 yaw at ModeOutputs.Rotation: camera +30.00 and stayed
+    3 s, camera position moved 227 units (expected chord for a 450 arm: 233, so it orbits); +10 pitch: +10.00, moved
+    78.8 (expected 78.4); both undone cleanly. The PC+0x6D0 native struct: no effect, reset by the game.
+  - Profile `profiles/SwGame-Win64-Shipping.ini`: `Object=Camera`, `Offsets=0x274C`, `RotatorSize=12` (keeps
+    `DualSenseAsDualShock4=1`). Deployed with Probe=0; needs a game restart and a gyro test. Probe gap: nested struct
+    rotators are never live-tested, although here the nested one was the answer (`ModeOutputs.Rotation`); the live test
+    could write them as raw offsets (owner offset + nested offset).
+  - **Dotted `Property=` and nested probe candidates (user's request; built, no version bump, not tested in game
+    yet).** `find_prop` resolves `Struct.Member` (any depth) through StructProperty types, offset = sum of the
+    offsets, so every caller (views, live test, `read_view_rotation`, `apply`) takes nested rotators and a profile can
+    name one by reflection instead of a build-specific raw offset (user's choice over raw `Offsets=`, safer for other
+    games). The live test no longer rejects nested properties ("nested in a struct" removed; it was untestable only
+    because `prop_of` didn't resolve dots), and the passive pick no longer skips them. Reflected candidates on the camera
+    manager are a passive "camera output" only inside the engine's `PlayerCameraManager` part (same rule as raw
+    offsets): `CameraCachePrivate.POV.Rotation` stays an output, `ModeOutputs.Rotation` (+0x274C) doesn't.
+    Profile now `Object=Camera`, `Property=ModeOutputs.Rotation`. To verify: the gyro with this profile, then Jedi with
+    the profile set aside and Probe=1 (the probe should verify `Camera.ModeOutputs.Rotation` by itself).
+  - **Probe test (user, Jedi, DualSense BT, profile set aside, Probe=1, 3 captures): the probe verified
+    `Camera.ModeOutputs.Rotation` live and wrote it as the game's profile** (`Property=ModeOutputs.Rotation`, same as
+    the hand-made one; the existing `[GyroUE] DualSenseAsDualShock4=1` kept). POV.Rotation and ControlRotation
+    rejected as overwritten, TransformComponent0 as no effect. The user then restarted with Probe=1 still set and saw no
+    gyro: the probe pauses the gyro (`applied yaw=0.0` all session), so the profile wasn't exercised. Probe=0 set; gyro
+    test pending. UX gap: after a VERIFIED LIVE profile, a restart with Probe=1 silently keeps the gyro paused.
+  - **Gyro test (user, DualSense BT, probe-written profile, Probe=0): works.** `camera: confirmed, the camera follows
+    the gyro (ModeOutputs.Rotation, view 'Camera')`; applied yaw/pitch move in gameplay, gyro off in menus/loads
+    (`view: none`). Repo profile marked verified. Not checked yet: combat, cutscenes, other camera modes (splines).
+  - **Probe UX (user's request; built, no version bump, not tested in game yet):** after a verified live result
+    (`finish_tests`, game profile or `.suggested.ini`), `disable_probe()` writes `Probe=0` to GyroUE.ini (and to the
+    game's profile if it sets Probe itself) and logs `probe: Probe=0 written ...`. The notice now says the camera was
+    found and verified, to RESTART THE GAME so the gyro turns the camera, and that the probe is off (or to set Probe=0
+    by hand if the write failed). Texts that asked to set Probe=0 by hand updated (probe log header, GyroUE.ini
+    default comment, profile header, ADVANCED.md).
 
 ## Dead ends
 

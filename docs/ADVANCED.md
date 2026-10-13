@@ -302,7 +302,9 @@ Offsets=0x68,0x80
 RotatorSize=12
 ```
 
-Once the camera follows the gyro, set `Probe=0` again in `GyroUE\GyroUE.ini`. Even a verified profile was only tested
+With a verified result GyroUE sets `Probe=0` in `GyroUE\GyroUE.ini` by itself (and in the game's profile, if that one
+set `Probe=1`), and the notice asks you to restart the game: the probe keeps the gyro paused while it runs, so the
+profile only takes effect on the next start. Even a verified profile was only tested
 on the camera of the captures: a game with other cameras (vehicles, aiming) may need more views (see below).
 
 **Manual.** `F7` takes a snapshot, turn the camera with the right stick only (well over 30° to one side **and**
@@ -368,6 +370,7 @@ Turn the chosen line into profile keys:
 | Path before `(` | `Object=` (e.g. `Pawn.View`). Omit it for `PC` + `ControlRotation`. |
 | `rot ... .PropertyName` | `Property=PropertyName` |
 | `raw ...+0x2A0` | `Offsets=0x2A0` (the offset of the **pitch** value, i.e. the start of the rotator) |
+| `rot ... .Struct.Rotation` (nested in a struct) | `Property=Struct.Rotation` (dotted path through struct properties, e.g. Jedi: Fallen Order's `Property=ModeOutputs.Rotation` on `Object=Camera`) |
 | `double` / `float` | `RotatorSize=24` (UE5) / `RotatorSize=12` (UE4) |
 | `WorldRotation=1` in the suggestion | keep it (a component with absolute rotation, Example 3) |
 
@@ -439,7 +442,8 @@ the view target as their object unless `Object=` is given. Each view gets its ow
 2. Check that the camera turns smoothly, that up is up, that aiming follows the camera, and that the right
    stick still works. If the camera jumps back or fights the gyro, you picked an output: try another
    candidate.
-3. Set `Probe=0` (or remove the line) once the profile works.
+3. Set `Probe=0` (or remove the line) once the profile works. The automatic probe does this by itself after a
+   verified result; with a hand-written profile it is up to you (while `Probe=1`, the gyro stays paused).
 
 Raw offsets depend on the exact game build and may break when the game is updated. Prefer a reflected property
 when one exists, and note the game version in the profile.
