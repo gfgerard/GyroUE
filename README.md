@@ -144,8 +144,8 @@ doesn't follow the gyro, GyroUE tells you on screen, and [Advanced](docs/ADVANCE
 | The Outer Worlds: Spacer's Choice Edition | ✅ Works | Native DualSense support: GyroUE leaves the controller to the game. |
 | Severed Steel | ✅ Works (tested on the demo) | **No `F10` panel** (DX11). Rename `MSVCP140.dll` and `MSVCP140_2.dll` in its `Binaries\Win64` folder (e.g. to `.bak`): it ships an old VC++ runtime that GyroLib can't use. Until you do, GyroUE leaves the gyro off and tells you so on screen. |
 | Gears of War: E-Day (Game Pass) | ⚠️ Campaign only, **with EasyAntiCheat disabled** | Install in `Binaries\WinGDK`. The gyro starts a few seconds after the main menu appears. Never play online with it. |
-| The Outer Worlds: Spacer's Choice Edition | ✅ Works | |
-| Hogwarts Legacy | ✅ Works | |
+| The Outer Worlds: Spacer's Choice Edition | ✅ Works |  |
+| Hogwarts Legacy | ✅ Works | Needs custom profile |
 | Mortal Shell | ✅ Works | **No `F10` panel** (DX11): change settings in `gyrolib.ini`. The game's own PlayStation support only knows the DualShock 4: its profile makes GyroUE show your DualSense (USB or Bluetooth) to it as one, with PlayStation icons, rumble and light bar. |
 
 

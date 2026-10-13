@@ -45,6 +45,7 @@ play.
 | The Outer Worlds: Spacer's Choice Edition | UE 4 | no | Generic path. Native DualSense (delay-loaded `libScePad.dll`): XInput translation stays off. |
 | Mortal Shell | UE 4.25+, DX11 | yes (shipped) | Generic camera path. The game links an old Sony pad library (`WinDualShock`) that knows only the DualShock 4: the profile sets `DualSenseAsDualShock4=1` (PlayStation icons, rumble, light bar). Other controllers (Switch Pro, DirectInput) are shown as Xbox ones; the Epic Online Services overlay rewrites the game's XInput import after GyroUE, which takes it back. Tested with a DualSense over USB and Bluetooth (buttons, sticks, rumble, light bar, native flick stick). No settings panel (DX11). |
 | Hogwarts Legacy | UE 4 | yes | Third person detached camera, new objects detected. Native DualSense (delay-loaded `libScePad.dll`): XInput translation stays off. |
+| Visage | UE 4  | no | First person camera XInput translation/Steam input needed. |
 
 
 Tested with a DualSense over USB/BT and Nintendo Switch Pro Controller. Requirements and limits:
