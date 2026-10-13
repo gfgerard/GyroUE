@@ -270,6 +270,14 @@ int setting(const wchar_t* key, int fallback) {
     return fallback;
 }
 
+// The game's profile describes camera views (a profile can also hold only [GyroUE] settings, e.g. the DualSense
+// learning below): the probe then writes its result as a suggestion instead.
+bool profile_has_views() {
+    wchar_t buffer[64];
+    return GetPrivateProfileSectionW(L"View.Default", buffer, 64, g_profile_path.c_str()) > 0 ||
+           GetPrivateProfileStringW(L"GyroUE", L"Views", L"", buffer, 64, g_profile_path.c_str()) > 0;
+}
+
 void load_profile() {
     View def;
     def.label = ini(L"View.Default", L"Label", L"Camera");
@@ -277,7 +285,7 @@ void load_profile() {
     load_view_extras(def, L"View.Default");
     g_views = {def};
     ensure_settings_file();
-    g_profile_existed = GetFileAttributesW(g_profile_path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    g_profile_existed = profile_has_views();
     g_probe = setting(L"Probe", 0) != 0;
     g_trace.wanted = setting(L"MotionTrace", 0) != 0;
     if (g_trace.wanted) log("settings: MotionTrace=1 (30 s from the first gameplay frame)");
@@ -573,6 +581,31 @@ void take_snapshot(const Scene& s) {
 // Writes the probe's result: the game's profile itself only when the live test verified it and the game had no
 // profile when it started (or the probe created it this session); otherwise <exe>.suggested.ini next to it. An
 // unverified guess never becomes the profile. Returns where it went (Nothing = no result yet).
+// The game's own PlayStation support closed the DualSense unread (it only knows the DualShock 4): remember it in the
+// game's profile, so from the next start GyroUE shows the DualSense to it as a DualShock 4 (PlayStation prompts, rumble,
+// light bar). Until then the auto mode shows it as an Xbox controller. Once per session.
+void learn_dualsense() {
+    static bool done = false;
+    if (done || !nativepad::dualsense_ignored() || !xinput::sony_library()) return;
+    done = true;
+    CreateDirectoryW((g_mod_dir + L"\\profiles").c_str(), nullptr);
+    const bool created = GetFileAttributesW(g_profile_path.c_str()) == INVALID_FILE_ATTRIBUTES;
+    if (created) {
+        const std::string header = "; GyroUE profile for " + narrow(g_exe_stem) + ", written by GyroUE.\r\n"
+                                   "; The game's own PlayStation support only knows the DualShock 4: the DualSense is shown to it as one.\r\n\r\n";
+        if (FILE* file = nullptr; _wfopen_s(&file, g_profile_path.c_str(), L"wb") == 0 && file) {
+            std::fwrite(header.data(), 1, header.size(), file);
+            std::fclose(file);
+        }
+    }
+    const bool ok = WritePrivateProfileStringW(L"GyroUE", L"DualSenseAsDualShock4", L"1", g_profile_path.c_str()) != 0;
+    log("dualsense: the game's own PlayStation support closed the DualSense unread (it only knows the DualShock 4): %s %s",
+        ok ? (created ? "profile created," : "profile updated,") : "could not write", narrow(g_profile_path).c_str());
+    if (ok)
+        notify::show(L"This game's PlayStation support doesn't know the DualSense: it works as an Xbox controller for now.\n"
+                     L"Restart the game to use it as a PlayStation controller (DualShock 4).", 15);
+}
+
 enum class Written { Nothing, Profile, Suggested };
 
 Written write_suggestion(bool& usable, bool& verified) {
@@ -584,10 +617,14 @@ Written write_suggestion(bool& usable, bool& verified) {
     const bool as_profile = usable && verified && (!g_profile_existed || g_profile_created);
     const std::string text = as_profile ? ue::probe_suggestion(narrow(g_exe_stem), summary, true, verified) : probe;
     const std::wstring path = g_mod_dir + L"\\profiles\\" + g_exe_stem + (as_profile ? L".ini" : L".suggested.ini");
+    // The profile's [GyroUE] settings (e.g. DualSenseAsDualShock4, learned earlier) survive the probe rewriting it.
+    std::wstring kept(4096, L'\0');
+    kept.resize(as_profile ? GetPrivateProfileSectionW(L"GyroUE", kept.data(), DWORD(kept.size()), path.c_str()) : 0);
     FILE* file = nullptr;
     if (_wfopen_s(&file, path.c_str(), L"wb") != 0) file = nullptr;
     const bool written = file && std::fwrite(text.data(), 1, text.size(), file) == text.size();
     if (file) std::fclose(file);
+    if (written && !kept.empty()) WritePrivateProfileSectionW(L"GyroUE", kept.c_str(), path.c_str());
     if (written && as_profile) g_profile_created = true;
     const char* what = as_profile ? "game profile" : "suggested profile";
     probe_log("probe: %s (%s)%s:\n%s", what, summary.c_str(),
@@ -1256,6 +1293,7 @@ void frame() {
     SDL_Gamepad* pad = xinput::selected_gamepad(g_gyro->get(), g_input->get(), out);
     const bool xinput_shown = xinput::frame(g_gyro->get(), g_input->get(), out);
     const bool native = nativepad::frame(pad, out.suppress_native_right_stick != 0 && !xinput_shown);
+    learn_dualsense();
     if ((xinput_shown || native) != g_stick_suppression) {
         g_stick_suppression = xinput_shown || native;
         gl_set_host_capabilities(g_gyro->get(), GL_HOST_MENU_STATE | (g_stick_suppression ? GL_HOST_NATIVE_STICK_SUPPRESSION : 0u));
@@ -1297,11 +1335,12 @@ void host_configure(const std::wstring& mod_dir, const std::wstring& exe_stem) {
     g_settings_path = mod_dir + L"\\GyroUE.ini";
     g_profile_path = mod_dir + L"\\profiles\\" + exe_stem + L".ini";
     load_profile();
-    nativepad::install(setting(L"NativeFlickStick", 0) != 0);
+    nativepad::install(setting(L"NativeFlickStick", 0) != 0, setting(L"DualSenseAsDualShock4", 0) != 0);
     xinput::Settings xs;
     xs.mode = setting(L"XInput", xinput::Auto);
     xs.nintendo_labels = setting(L"XInputNintendoLabels", 0) != 0;
     xs.touchpad_back = setting(L"XInputTouchpadBack", 1) != 0;
+    xs.trace = setting(L"XInputTrace", 0) != 0;
     xinput::install(xs);
 }
 

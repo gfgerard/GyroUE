@@ -43,6 +43,7 @@ play.
 | Life is Strange Remastered | UE 4 (pre-4.25 property system), DX11 | yes (shipped) | Found with the camera probe. The camera splits pitch and yaw across two raw rotators, and the walking camera blends back to an automatic follow camera unless it gets look input; the profile writes `OnGyro=` to keep it manual. No settings panel (DX11): configure via `gyrolib.ini`. |
 | Luto | UE 5.5.4 | no | Generic path working OOB. Only reads XInput: GyroUE shows the DualSense / Switch Pro as an Xbox controller (Epic, no Steam Input). |
 | The Outer Worlds: Spacer's Choice Edition | UE 4 | no | Generic path. Native DualSense (delay-loaded `libScePad.dll`): XInput translation stays off. |
+| Mortal Shell | UE 4.25+, DX11 | yes (shipped) | Generic camera path. The game links an old Sony pad library (`WinDualShock`) that knows only the DualShock 4: the profile sets `DualSenseAsDualShock4=1` (PlayStation icons, rumble, light bar). Other controllers (Switch Pro, DirectInput) are shown as Xbox ones; the Epic Online Services overlay rewrites the game's XInput import after GyroUE, which takes it back. Tested with a DualSense over USB and Bluetooth (buttons, sticks, rumble, light bar, native flick stick). No settings panel (DX11). |
 | Hogwarts Legacy | UE 4 | yes | Third person detached camera, new objects detected. Native DualSense (delay-loaded `libScePad.dll`): XInput translation stays off. |
 
 
@@ -79,8 +80,12 @@ All diagnostics go to `GyroUE\GyroUE.log` (probe results, if enabled, to `GyroUE
 | `xinput: ... not shown: <reason>` | Why it isn't: an Xbox/Steam Input/remapper controller is connected, or the game reads pads itself (Sony's pad library, its own SDL, Raw Input for gamepads, the controller's HID device, DirectInput). `XInput=2` overrides the last group. |
 | `nativepad: the game reads 054C:0CE6 (...): N bytes, first byte 0x31, report 0x31 (DualSense, Bluetooth)` | The game reads the controller itself (Sony's pad library). `unknown layout, left alone` means a report GyroUE doesn't know: no native flick stick for it. |
 | `nativepad: ... matches SDL` / `native right-stick suppression available` | The right stick in the game's reports agreed with SDL while you moved it: GyroLib's flick options are offered. `doesn't match SDL` or `CRC isn't the expected one`: GyroUE leaves the reports alone (report it with the log). |
+| `dualsense: the game's own PlayStation support closed the DualSense unread ...` | The game's Sony library only knows the DualShock 4. `DualSenseAsDualShock4=1` was written to its profile (`GyroUE\profiles\<exe>.ini`, created if needed); the DualSense is an Xbox controller until the game restarts. |
+| `nativepad: DualSense 054C:0CE6 (version ...) shown to the game as a DualShock 4` | `DualSenseAsDualShock4=1` in the game's profile: the game asked who the controller is and got a DualShock 4. Then `feature report 0x.. asked by the game: answered with ...` lists what it checked, and `output report 0x05 -> DualSense report 0x02/0x31` its rumble and light bar. `opened ... Bluetooth, shown to it as a USB DualShock 4` and `Bluetooth, ... reads, converted` for a Bluetooth DualSense. If the game opens the controller and closes it for good right after the identity line, it rejected the emulation: report it with the log. |
 | `nativepad: right stick centred in the game's reports` | Flick stick is active: the game sees a centred right stick (`passed through` when it stops, e.g. in menus). |
 | `xinput: XInput=2: the game's access to HID device 054C:0CE6 refused` | With `XInput=2` the game tried to open the controller itself (its own DualSense support) and was refused, so it only gets the Xbox controller. `Raw Input registration ... dropped` is the same for Raw Input. |
+| `hooks: the import of ... was written back by something else (now <module>)` | Another module (an overlay such as Epic Online Services' `EOSOVH-Win64-Shipping.dll`) rewrote a game import GyroUE had patched. XInput imports are `patched again` so the translated controller keeps reaching the game; others are `left to it`. |
+| `xinput trace: ...` | `XInputTrace=1` (diagnostics): every module that calls XInput, and whether the game loads Windows.Gaming.Input, GameInput or DirectInput. |
 | `xinput: XInputGetState hook registered, no game module imports it yet` | The game hasn't loaded its XInput code yet, or uses another input API (then there is nothing to translate). |
 | `deps:` lines | Before loading GyroLib, GyroUE checks which copy of each DLL GyroLib shares with the game (Visual C++ runtime, SDL3): one already loaded by the game, or one next to its exe, is the one GyroLib gets. `older than 14.40, GyroLib ... would crash the game` turns the gyro off for the session (the game still starts) and shows the fix: rename the game's copies so Windows' newer ones are used. `older than GyroLib's build tools` and `the game's own SDL3` are warnings only. |
 
@@ -114,8 +119,10 @@ DualSense --HID--> SDL3 (inside gyrolib.dll)
   Once per frame GyroUE copies the SDL state of GyroLib's selected controller into the slot it answers for (the
   first one with no real controller), and turns `XInputSetState` into SDL rumble. In auto mode it waits 2 s after
   the controller appears, and stays off if a real XInput controller is connected or the game shows signs of reading
-  pads itself: `libScePad*.dll`, `hid.dll` or an SDL of its own imported (also delay-load), or such a library loaded, `RegisterRawInputDevices` for joysticks/gamepads,
-  `CreateFileW` on the controller's HID device, or `DirectInput8Create`. When the controller appears or goes, it
+  pads itself. Sony's pad library (`libScePad*.dll` or `hid.dll` imported, also delay-load, or `libScePad` loaded)
+  only counts for a PlayStation controller: other controllers are still translated there. For any controller: an SDL
+  of its own, `RegisterRawInputDevices` for joysticks/gamepads, `DirectInput8Create`, or `CreateFileW` on the
+  controller's HID device (only without a Sony library, whose enumeration opens every HID device). When the controller appears or goes, it
   posts `WM_DEVICECHANGE` to the game's `UnrealWindow`s, because Unreal only checks empty XInput slots after that
   message. With `XInput=2` the game's `CreateFileW` on PlayStation/Nintendo HID devices (and the selected
   controller's) fails with access denied, also inside a separate `libScePad.dll` (whose import table is patched for
@@ -131,6 +138,18 @@ DualSense --HID--> SDL3 (inside gyrolib.dll)
   must carry the expected CRC32 (0xA1 + report). Once that stick agrees with SDL's while it is held away from the
   centre, GyroUE declares native stick suppression to GyroLib; while GyroLib then asks for it, the stick bytes in the
   game's copy are set to 128 (and the CRC recomputed). The controller and GyroLib's own SDL reading are untouched.
+- DualSense as a DualShock 4 (`nativepad.cpp`), for games whose Sony library predates the DualSense. Detection: the
+  game's Sony library opens every controller it finds; one it supports stays open and is read at once, one it doesn't
+  is closed unread. A DualSense opened, closed unread and not open 5 s later (with a Sony library among the game's
+  imports) makes GyroUE write `[GyroUE] DualSenseAsDualShock4=1` into the game's profile and translate the DualSense to
+  XInput for that session: the library only looks for controllers when the game starts (not on `WM_DEVICECHANGE`, tested
+  in Mortal Shell), so the new identity can only work from the next start. A profile can also ship the key. With it,
+  on the game's own handles to a DualSense: on the game's own handles to a DualSense, `HidD_GetAttributes` reports a USB DualShock 4 (054C:09CC,
+  version 0x0100), `HidP_GetCaps` / `HidP_GetValueCaps` its report sizes and feature reports, and `HidD_GetFeature`
+  answers the DualShock 4's calibration (from the DualSense's), address and firmware reports; the game's feature
+  writes are not passed on. Input reports are rewritten as DualShock 4 USB reports (over Bluetooth GyroUE reads the
+  longer reports itself and hands the game converted ones), and the game's DualShock 4 output report (rumble, light
+  bar) is sent as the DualSense's (with its CRC over Bluetooth).
 - Every memory read through reflection is guarded, so a missing object or property disables the feature
   instead of crashing the game.
 - The settings panel hooks DXGI factory and swapchain vtables (`Present`, `ResizeBuffers`) and subclasses

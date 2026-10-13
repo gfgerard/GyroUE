@@ -26,6 +26,14 @@ bool add_ordinal(const char* dll, WORD ordinal, const char* function, void* repl
 // it loads), for hooks that must see how that library opens the controller.
 bool add_with_pad_library(const char* dll, const char* function, void* replacement, void** original);
 
+// Import slots this module patched that were written back by something else (another mod, an overlay, the game) are
+// patched again; the first time for each slot is logged. Returns how many were fixed. Any thread.
+int verify();
+
+// Inline hook (MinHook) on any function, e.g. a system DLL's export, for diagnostics that must see every caller.
+// *original receives the trampoline. Returns false if the hook couldn't be created or enabled.
+bool hook_function(void* target, void* replacement, void** original);
+
 // True when the exe's import table is a protector stub (or GYROUE_INLINE=1): add() then hooks the
 // named DLL's export inline instead of import slots.
 bool inline_mode();

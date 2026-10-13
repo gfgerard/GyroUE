@@ -15,10 +15,22 @@ namespace gyroue::nativepad {
 
 // DllMain (after hooks::init): CreateFileW in the game modules and a separate libScePad*.dll; with suppression also
 // ReadFile, GetOverlappedResult(Ex) and CloseHandle. Nothing on protected exes (inline-hook mode).
-void install(bool suppression);
+// dualsense_as_ds4: a DualSense (USB or Bluetooth) is shown to the game's own PlayStation support as a USB DualShock 4
+// (identity, caps, feature reports, input and output reports converted), for games whose Sony library predates the
+// DualSense.
+// dualsense_as_ds4: the game's profile says its PlayStation support only knows the DualShock 4 (written there by the
+// host when dualsense_ignored() was seen in an earlier session, or shipped with the profile).
+void install(bool suppression, bool dualsense_as_ds4);
+
+// The game opened a DualSense, closed it again unread and has none open 5 s later: its own PlayStation support doesn't
+// take the DualSense (only the DualShock 4). False with dualsense_as_ds4 or once the game read a DualSense.
+bool dualsense_ignored();
 
 // XInput=2: refuse the game's opens of Sony/Nintendo HID devices and of the selected controller.
 void refuse_pads(bool refuse);
+
+// Vendor or product ID (key "vid" / "pid") in a HID device path, USB or Bluetooth form; 0 if absent.
+uint16_t hid_path_id(const wchar_t* path, const wchar_t* key);
 
 // The game opened a HID device of this vendor itself (auto mode's native-support check).
 bool opened_vendor(uint16_t vendor);

@@ -11,9 +11,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <cwctype>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace gyroue::nativepad {
 namespace {
@@ -23,12 +26,29 @@ using ReadFile_t = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
 using GetOverlappedResult_t = BOOL(WINAPI*)(HANDLE, LPOVERLAPPED, LPDWORD, BOOL);
 using GetOverlappedResultEx_t = BOOL(WINAPI*)(HANDLE, LPOVERLAPPED, LPDWORD, DWORD, BOOL);
 using CloseHandle_t = BOOL(WINAPI*)(HANDLE);
+using WriteFile_t = BOOL(WINAPI*)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
+using GetAttributes_t = BOOLEAN(__stdcall*)(HANDLE, PHIDD_ATTRIBUTES);
+using GetString_t = BOOLEAN(__stdcall*)(HANDLE, PVOID, ULONG);
+using Feature_t = BOOLEAN(__stdcall*)(HANDLE, PVOID, ULONG);
+using GetPreparsedData_t = BOOLEAN(__stdcall*)(HANDLE, PHIDP_PREPARSED_DATA*);
+using FreePreparsedData_t = BOOLEAN(__stdcall*)(PHIDP_PREPARSED_DATA);
+using GetCaps_t = NTSTATUS(__stdcall*)(PHIDP_PREPARSED_DATA, PHIDP_CAPS);
+using GetValueCaps_t = NTSTATUS(__stdcall*)(HIDP_REPORT_TYPE, PHIDP_VALUE_CAPS, PUSHORT, PHIDP_PREPARSED_DATA);
 
 CreateFileW_t g_create_file = nullptr;
 ReadFile_t g_read_file = nullptr;
 GetOverlappedResult_t g_get_overlapped = nullptr;
 GetOverlappedResultEx_t g_get_overlapped_ex = nullptr;
 CloseHandle_t g_close_handle = nullptr;
+WriteFile_t g_write_file = nullptr;
+GetAttributes_t g_get_attributes = nullptr;
+GetString_t g_get_product = nullptr;
+Feature_t g_get_feature = nullptr;
+Feature_t g_set_feature = nullptr;
+GetPreparsedData_t g_get_preparsed = nullptr;
+FreePreparsedData_t g_free_preparsed = nullptr;
+GetCaps_t g_get_caps = nullptr;
+GetValueCaps_t g_get_value_caps = nullptr;
 
 // The original of an import: from the hook, else from the DLL the game imports it from (never called from DllMain).
 template <typename F>
@@ -47,6 +67,15 @@ constexpr uint16_t kSony = 0x054C;
 constexpr uint16_t kNintendo = 0x057E;
 
 bool g_suppression = false;            // NativeFlickStick: the read hooks are installed
+bool g_as_ds4 = false;                 // DualSenseAsDualShock4: a DualSense is shown to the game as a USB DualShock 4
+// Does the game's own PlayStation support take a DualSense? Its Sony library opens every controller it finds; one it
+// supports stays open and is read within milliseconds, one it doesn't is closed again unread (Mortal Shell: open,
+// HidD_GetAttributes, close). The library only looks at controllers when the game starts (it doesn't look again on
+// WM_DEVICECHANGE), so the DualShock 4 identity can only take effect from the next start (the host writes it to the
+// game's profile).
+std::atomic<ULONGLONG> g_dualsense_opened{0};  // the game first opened a DualSense
+std::atomic<bool> g_dualsense_read{false};     // the game read a DualSense
+bool g_follow = false;                 // either of them: the game's controller handles are followed
 std::atomic<bool> g_refuse{false};     // XInput=2
 std::atomic<uint32_t> g_pad_ids{0};    // selected controller: vendor << 16 | product
 std::atomic<int> g_refused{0};
@@ -78,6 +107,21 @@ uint16_t path_id(const wchar_t* path, const wchar_t* key) {
     return 0;
 }
 
+// Diagnostics: each HID device the game opens, once per vendor/product and kind of access.
+void log_open(uint16_t vendor, uint16_t product, bool reads, bool ok) {
+    static std::mutex mutex;
+    static uint32_t seen[32];
+    static int count = 0;
+    const uint32_t key = uint32_t(vendor) << 16 | product;
+    const uint32_t entry = key ^ (reads ? 0x80000000u : 0) ^ (ok ? 0 : 0x40000000u);
+    std::lock_guard lock(mutex);
+    for (int i = 0; i < count; ++i)
+        if (seen[i] == entry) return;
+    if (count < 32) seen[count++] = entry;
+    log("input: the game opens HID device %04X:%04X %s%s", vendor, product,
+        reads ? "for reading" : "without read access (looking at it)", ok ? "" : " (failed)");
+}
+
 // XInput=2: PlayStation and Nintendo pads, plus the selected controller.
 bool refused_device(uint16_t vendor, uint16_t product) {
     if (vendor == kSony || vendor == kNintendo) return true;
@@ -97,8 +141,14 @@ struct Device {
     std::atomic<int32_t> stick{-1};         // right stick in that report before any change: x | y << 8
     std::atomic<bool> logged{false};        // first report logged
     std::atomic<bool> crc_warned{false};
+    bool ds4 = false;                       // a DualSense shown to the game as a (USB) DualShock 4
+    bool bluetooth = false;                 // connected over Bluetooth
+    DWORD output_length = 0;                // the real device's output and feature report lengths
+    DWORD feature_length = 0;
+    uint8_t counter = 0;                    // DualShock 4 report counter (6 bits)
+    uint8_t out[640] = {};                  // converted output report (stays valid during an overlapped write)
 };
-constexpr int kMaxDevices = 8;
+constexpr int kMaxDevices = 16;
 Device g_devices[kMaxDevices];
 std::atomic<int> g_device_count{0};
 
@@ -124,27 +174,30 @@ int find_device(HANDLE h) {
     return -1;
 }
 
-// The device's input report length: one ReadFile can return several reports back to back (Pacific Drive's
-// libScePad reads 640 bytes, ten 64-byte USB reports, at once). hid.dll is resolved here, never in DllMain.
-DWORD input_report_length(HANDLE h) {
-    using GetPreparsedData_t = BOOLEAN(__stdcall*)(HANDLE, PHIDP_PREPARSED_DATA*);
-    using FreePreparsedData_t = BOOLEAN(__stdcall*)(PHIDP_PREPARSED_DATA);
-    using GetCaps_t = NTSTATUS(__stdcall*)(PHIDP_PREPARSED_DATA, PHIDP_CAPS);
+// The device's real report lengths (the hid.dll exports themselves, not the game's hooked imports): one ReadFile can
+// return several input reports back to back (Pacific Drive's libScePad reads 640 bytes, ten 64-byte USB reports, at
+// once). hid.dll is resolved here, never in DllMain.
+HIDP_CAPS device_caps(HANDLE h) {
+    HIDP_CAPS caps{};
     HMODULE hid = LoadLibraryW(L"hid.dll");
-    if (!hid) return 0;
+    if (!hid) return caps;
     auto get_data = reinterpret_cast<GetPreparsedData_t>(GetProcAddress(hid, "HidD_GetPreparsedData"));
     auto free_data = reinterpret_cast<FreePreparsedData_t>(GetProcAddress(hid, "HidD_FreePreparsedData"));
     auto get_caps = reinterpret_cast<GetCaps_t>(GetProcAddress(hid, "HidP_GetCaps"));
     PHIDP_PREPARSED_DATA data = nullptr;
-    if (!get_data || !free_data || !get_caps || !get_data(h, &data)) return 0;
-    HIDP_CAPS caps{};
-    const bool ok = get_caps(data, &caps) == HIDP_STATUS_SUCCESS;
+    if (!get_data || !free_data || !get_caps || !get_data(h, &data)) return caps;
+    if (get_caps(data, &caps) != HIDP_STATUS_SUCCESS) caps = {};
     free_data(data);
-    return ok ? caps.InputReportByteLength : 0;
+    return caps;
 }
 
-void track(HANDLE h, uint16_t vendor, uint16_t product) {
-    const DWORD length = input_report_length(h);
+bool is_dualsense(uint16_t vendor, uint16_t product) {
+    return vendor == kSony && (product == 0x0CE6 || product == 0x0DF2);  // DualSense, DualSense Edge
+}
+
+void track(HANDLE h, uint16_t vendor, uint16_t product, bool ds4, bool bluetooth) {
+    const HIDP_CAPS caps = device_caps(h);
+    const DWORD length = caps.InputReportByteLength;
     std::lock_guard lock(g_mutex);
     if (find_device(h) >= 0) return;
     for (Device& d : g_devices) {
@@ -156,10 +209,15 @@ void track(HANDLE h, uint16_t vendor, uint16_t product) {
         d.stick = -1;
         d.logged = false;
         d.crc_warned = false;
+        d.ds4 = ds4;
+        d.output_length = caps.OutputReportByteLength;
+        d.feature_length = caps.FeatureReportByteLength;
+        d.bluetooth = bluetooth;
+        d.counter = 0;
         d.handle.store(h, std::memory_order_release);
         ++g_device_count;
-        log("nativepad: the game opened controller %04X:%04X for reading (handle %p, %lu-byte input reports)", vendor,
-            product, h, length);
+        log("nativepad: the game opened controller %04X:%04X (handle %p, %lu-byte input reports)%s", vendor, product, h,
+            length, ds4 ? (bluetooth ? ", Bluetooth, shown to it as a USB DualShock 4" : ", shown to it as a DualShock 4") : "");
         return;
     }
     log("nativepad: more than %d controller handles open; %04X:%04X not followed", kMaxDevices, vendor, product);
@@ -228,8 +286,8 @@ uint32_t crc32(const uint8_t* data, size_t n, uint32_t crc) {
     return crc;
 }
 
-uint32_t report_crc(const uint8_t* r, int length) {
-    const uint8_t seed = 0xA1;  // Bluetooth HID input header, part of the checksum but not of the report
+// Bluetooth reports carry a CRC32 of the HID header byte (0xA1 input, 0xA2 output) followed by the report.
+uint32_t report_crc(const uint8_t* r, int length, uint8_t seed = 0xA1) {
     return ~crc32(r, size_t(length), crc32(&seed, 1, 0xFFFFFFFFu));
 }
 
@@ -259,17 +317,74 @@ int32_t handle_report(Device& d, uint8_t* r, DWORD length, bool change) {
     return stick;
 }
 
+// A USB DualSense input report (0x01, 64 bytes) rewritten in place as a USB DualShock 4 report (0x01, 64 bytes):
+//   DualSense: LX LY RX RY at 1-4, L2 R2 at 5-6, sequence 7, buttons 8-10 (same bits as the DualShock 4's 5-7),
+//              gyro 16-21, accelerometer 22-27, timestamp 28-31 (0.33 us), temperature 32, touch 33-40
+//   DualShock 4: LX LY RX RY at 1-4, buttons 5-6, PS/touchpad + 6-bit counter 7, L2 R2 8-9, timestamp 10-11
+//              (5.33 us), temperature 12, gyro 13-18, accelerometer 19-24, battery/cable 30, touch 33-42
+void dualsense_to_ds4(Device& d, uint8_t* r) {
+    uint8_t s[64];
+    std::memcpy(s, r, 64);
+    std::memset(r + 5, 0, 59);
+    r[5] = s[8];
+    r[6] = s[9];
+    r[7] = uint8_t((s[10] & 0x03) | (d.counter << 2));
+    d.counter = uint8_t((d.counter + 1) & 0x3F);
+    r[8] = s[5];
+    r[9] = s[6];
+    const uint32_t stamp = uint32_t(s[28]) | uint32_t(s[29]) << 8 | uint32_t(s[30]) << 16 | uint32_t(s[31]) << 24;
+    const uint16_t ds4_stamp = uint16_t(stamp / 16);
+    r[10] = uint8_t(ds4_stamp);
+    r[11] = uint8_t(ds4_stamp >> 8);
+    r[12] = s[32];
+    std::memcpy(r + 13, s + 16, 6);
+    std::memcpy(r + 19, s + 22, 6);
+    r[30] = 0x1B;  // cable connected, battery full
+    r[33] = 1;     // one touch packet
+    r[34] = s[7];
+    std::memcpy(r + 35, s + 33, 8);
+}
+
+// One report of a DualSense over Bluetooth (length bytes at raw) as a USB DualShock 4 report (64 bytes at out):
+// 0x31 (the full report, after GyroLib's SDL asked for it) is the USB report shifted by one byte; 0x01 (the basic
+// report a DualSense sends before that) already has the DualShock 4's first ten bytes. False for anything else.
+bool bluetooth_to_ds4(Device& d, const uint8_t* raw, DWORD length, uint8_t* out) {
+    if (length >= 78 && raw[0] == 0x31) {
+        out[0] = 0x01;
+        std::memcpy(out + 1, raw + 2, 63);
+        dualsense_to_ds4(d, out);
+        return true;
+    }
+    if (length >= 10 && raw[0] == 0x01) {
+        std::memset(out, 0, 64);
+        std::memcpy(out, raw, 10);
+        out[7] = uint8_t((raw[7] & 0x03) | (d.counter << 2));
+        d.counter = uint8_t((d.counter + 1) & 0x3F);
+        out[30] = 0x1B;
+        return true;
+    }
+    return false;
+}
+
 // What the game just received from controller i (n bytes at r, one or more reports of the device's report length):
 // note the newest right stick, and centre it in every report while GyroLib's flick stick asks for that.
-void on_report(int i, uint8_t* r, DWORD n, const char* how) {
+void on_report(int i, uint8_t* r, DWORD n, const char* how, DWORD chunk = 0) {
     Device& d = g_devices[i];
     if (!r || !n) return;
-    DWORD length = d.report_length;
+    DWORD length = chunk ? chunk : d.report_length;
     if (!length) length = r[0] == 0x01 && n % 64 == 0 ? 64 : r[0] == 0x31 && n % 78 == 0 ? 78 : n;  // usual sizes
     if (length > n || n % length) length = n;  // not whole reports: treat it as one
-    if (!d.logged.exchange(true))
-        log("nativepad: the game reads %04X:%04X (%s): %lu bytes (%lu report(s) of %lu), first byte 0x%02X, %s", d.vendor,
-            d.product, how, n, n / length, length, r[0], layout_of(r, length).name);
+    if (!d.logged.exchange(true)) {
+        char head[3 * 8 + 1] = {};
+        for (DWORD k = 0; k < n && k < 8; ++k) std::snprintf(head + 3 * k, 4, "%02X ", r[k]);
+        log("nativepad: the game reads %04X:%04X (%s): %lu bytes (%lu report(s) of %lu), starts %s- %s", d.vendor, d.product,
+            how, n, n / length, length, head, d.vendor == kSony ? layout_of(r, length).name : "not a Sony controller, left alone");
+    }
+    if (d.vendor != kSony) return;
+    if (is_dualsense(d.vendor, d.product)) g_dualsense_read = true;
+    if (d.ds4 && !d.bluetooth)
+        for (DWORD at = 0; at + 64 <= n && length == 64; at += 64)
+            if (r[at] == 0x01) dualsense_to_ds4(d, r + at);
     const bool change =
         g_suppress.load(std::memory_order_relaxed) && (uint32_t(d.vendor) << 16 | d.product) == g_pad_ids.load();
     int32_t newest = -1;
@@ -323,12 +438,25 @@ HANDLE WINAPI hk_create_file(LPCWSTR path, DWORD access, DWORD share, LPSECURITY
     }
     CreateFileW_t real = original(g_create_file, "CreateFileW", "kernel32.dll");
     HANDLE h = real ? real(path, access, share, sa, disposition, flags, templ) : INVALID_HANDLE_VALUE;
-    if (h == INVALID_HANDLE_VALUE || !g_suppression) return h;
     // An enumeration opens each device without access rights; only handles that can read are followed.
     const bool reads = (access & (GENERIC_READ | GENERIC_ALL | MAXIMUM_ALLOWED | FILE_READ_DATA)) != 0;
-    if (hid && vendor == kSony && reads) {
+    if (hid && vendor) {
         const DWORD error = GetLastError();
-        track(h, vendor, product);
+        log_open(vendor, product, reads, h != INVALID_HANDLE_VALUE);
+        SetLastError(error);
+    }
+    if (h == INVALID_HANDLE_VALUE || !g_follow) return h;
+    // A DualSense shown as a DualShock 4 is followed even when only looked at: the game identifies it then.
+    const bool bluetooth = hid && std::wcsstr(path, L"{00001124") != nullptr;
+    const bool dualsense = hid && is_dualsense(vendor, product);
+    const bool ds4 = g_as_ds4 && dualsense;
+    if (dualsense) {
+        ULONGLONG expected = 0;
+        g_dualsense_opened.compare_exchange_strong(expected, GetTickCount64());
+    }
+    if (hid && vendor && (dualsense || (g_suppression && reads))) {  // every HID device read is logged; only Sony reports change
+        const DWORD error = GetLastError();
+        track(h, vendor, product, ds4, bluetooth);
         SetLastError(error);
     } else if (g_device_count.load(std::memory_order_relaxed) && find_device(h) >= 0) {
         const DWORD error = GetLastError();
@@ -338,8 +466,55 @@ HANDLE WINAPI hk_create_file(LPCWSTR path, DWORD access, DWORD share, LPSECURITY
     return h;
 }
 
+// A read of a Bluetooth DualSense shown as a USB DualShock 4: the game's buffer holds 64-byte reports, the device's
+// are longer (78 bytes and up), so GyroUE reads them into its own buffer (same number of reports) and gives the game
+// converted ones. Overlapped reads are waited for here (reports come every few milliseconds) and completed at once.
+BOOL bluetooth_read(int i, ReadFile_t real, HANDLE h, LPVOID buffer, DWORD size, LPDWORD read, LPOVERLAPPED ol) {
+    Device& d = g_devices[i];
+    const DWORD report = d.report_length ? d.report_length : 78;
+    const DWORD count = std::max<DWORD>(1, size / 64);
+    thread_local std::vector<uint8_t> raw;
+    raw.assign(size_t(count) * report, 0);
+    DWORD got = 0;
+    BOOL ok = FALSE;
+    if (ol) {
+        thread_local HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        OVERLAPPED mine{};
+        mine.hEvent = event;
+        ResetEvent(event);
+        ok = real(h, raw.data(), DWORD(raw.size()), nullptr, &mine);
+        if (!ok && GetLastError() == ERROR_IO_PENDING) {
+            if (WaitForSingleObject(event, 1000) != WAIT_OBJECT_0) CancelIoEx(h, &mine);
+            GetOverlappedResult_t get = original(g_get_overlapped, "GetOverlappedResult", "kernel32.dll");
+            ok = get && get(h, &mine, &got, TRUE);
+            if (!ok && GetLastError() == ERROR_OPERATION_ABORTED) ok = TRUE, got = 0;  // nothing within a second
+        } else if (ok) {
+            got = DWORD(mine.InternalHigh);
+        }
+    } else {
+        ok = real(h, raw.data(), DWORD(raw.size()), &got, nullptr);
+    }
+    if (!ok) return FALSE;
+    auto* out = static_cast<uint8_t*>(buffer);
+    DWORD n = 0;
+    for (DWORD at = 0; at + report <= got && n + 64 <= size; at += report)
+        if (bluetooth_to_ds4(d, raw.data() + at, report, out + n)) n += 64;
+    on_report(i, out, n, ol ? "Bluetooth, overlapped reads, converted" : "Bluetooth, synchronous reads, converted", 64);
+    if (ol) {
+        ol->Internal = 0;
+        ol->InternalHigh = n;
+        if (ol->hEvent) SetEvent(ol->hEvent);
+    }
+    if (read) *read = n;
+    SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
 BOOL WINAPI hk_read_file(HANDLE h, LPVOID buffer, DWORD size, LPDWORD read, LPOVERLAPPED ol) {
     ReadFile_t real = original(g_read_file, "ReadFile", "kernel32.dll");
+    if (g_as_ds4 && real && buffer && g_device_count.load(std::memory_order_relaxed))
+        if (const int i = find_device(h); i >= 0 && g_devices[i].ds4 && g_devices[i].bluetooth)
+            return bluetooth_read(i, real, h, buffer, size, read, ol);
     const BOOL ok = real ? real(h, buffer, size, read, ol) : FALSE;
     if (!g_device_count.load(std::memory_order_relaxed)) return ok;
     const int i = find_device(h);
@@ -375,6 +550,286 @@ BOOL WINAPI hk_get_overlapped_ex(HANDLE h, LPOVERLAPPED ol, LPDWORD n, DWORD tim
     return ok;
 }
 
+// The followed DualSense shown as a DualShock 4 (index into g_devices), or -1.
+int ds4_device(HANDLE h) {
+    if (!g_as_ds4 || !g_device_count.load(std::memory_order_relaxed)) return -1;
+    const int i = find_device(h);
+    return i >= 0 && g_devices[i].ds4 ? i : -1;
+}
+
+constexpr uint16_t kDs4Product = 0x09CC;  // DualShock 4 (second version)
+
+BOOLEAN __stdcall hk_get_attributes(HANDLE h, PHIDD_ATTRIBUTES attributes) {
+    GetAttributes_t real = original(g_get_attributes, "HidD_GetAttributes", "hid.dll");
+    const BOOLEAN ok = real ? real(h, attributes) : FALSE;
+    if (ok && attributes && ds4_device(h) >= 0) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true))
+            log("nativepad: DualSense %04X:%04X (version %04X) shown to the game as a DualShock 4 (%04X:%04X, version 0100)",
+                attributes->VendorID, attributes->ProductID, attributes->VersionNumber, kSony, kDs4Product);
+        attributes->ProductID = kDs4Product;
+        // Sony's library reads the version as decimal digits and wants at least 23: a USB DualSense passes, over
+        // Bluetooth Windows reports another value and the pad is skipped. A USB DualShock 4 reports 0x0100.
+        attributes->VersionNumber = 0x0100;
+    }
+    return ok;
+}
+
+BOOLEAN __stdcall hk_get_product(HANDLE h, PVOID buffer, ULONG length) {
+    if (ds4_device(h) >= 0 && buffer && length >= 2) {
+        const wchar_t name[] = L"Wireless Controller";
+        const size_t chars = std::min<size_t>(length / sizeof(wchar_t) - 1, std::size(name) - 1);
+        std::memcpy(buffer, name, chars * sizeof(wchar_t));
+        static_cast<wchar_t*>(buffer)[chars] = 0;
+        return TRUE;
+    }
+    GetString_t real = original(g_get_product, "HidD_GetProductString", "hid.dll");
+    return real ? real(h, buffer, length) : FALSE;
+}
+
+// Feature reports a DualShock 4 driver asks for, answered from the DualSense: 0x02 calibration (the DualSense's 0x05
+// has the same layout), 0x12 / 0x81 the controller's address (DualSense 0x09), 0xA3 (firmware) zeros; any other ID
+// fails, as on a real DualShock 4. Only the report's own size is written: like the device, never the whole buffer the
+// game says it has (Mortal Shell passes a larger length than the buffer it allocated for 0x12).
+DWORD ds4_feature_size(uint8_t id) {
+    switch (id) {
+    case 0x02: return 37;
+    case 0x12: return 16;
+    case 0x81: return 7;
+    case 0xA3: return 49;
+    default: return 0;
+    }
+}
+
+BOOLEAN __stdcall hk_get_feature(HANDLE h, PVOID buffer, ULONG length) {
+    Feature_t real = original(g_get_feature, "HidD_GetFeature", "hid.dll");
+    if (ds4_device(h) < 0 || !buffer || !length) return real ? real(h, buffer, length) : FALSE;
+    auto* b = static_cast<uint8_t*>(buffer);
+    const uint8_t id = b[0];
+    const DWORD size = ds4_feature_size(id);
+    const int device = ds4_device(h);
+    uint8_t source[640] = {};
+    // The DualSense's own feature reports: their exact size over USB, the device's feature length over Bluetooth.
+    const auto read_feature = [&](uint8_t source_id, ULONG usb_size) {
+        source[0] = source_id;
+        const Device& d = g_devices[device];
+        const ULONG n = d.bluetooth && d.feature_length ? std::min<ULONG>(d.feature_length, sizeof source) : usb_size;
+        return real && real(h, source, n);
+    };
+    const char* how = "zeros";
+    BOOLEAN ok = TRUE;
+    if (!size || length < size) {
+        ok = FALSE;
+        how = size ? "nothing (buffer too small)" : "nothing (not a DualShock 4 report this emulation knows)";
+    } else {
+        std::memset(b + 1, 0, size - 1);
+    }
+    if (!ok) {
+    } else if (id == 0x02) {
+        ok = read_feature(0x05, 41);
+        if (ok) std::memcpy(b + 1, source + 1, 34);
+        how = ok ? "the DualSense's calibration (0x05)" : "failed to read the DualSense's calibration";
+    } else if (id == 0xA3) {
+        // Build date and time strings, then little-endian versions at 0x21, 0x23 (hardware: Sony's library needs at
+        // least 0x3100), 0x25 (32 bits), 0x29, 0x2B, 0x2D (32 bits).
+        std::memcpy(b + 1, "Sep 21 2018", 11);
+        std::memcpy(b + 17, "04:50:51", 8);
+        const uint16_t versions[] = {0x0100, 0xB400, 0, 0, 0xA007, 0x0001};
+        const int at[] = {0x21, 0x23, 0x25, 0x27, 0x29, 0x2B};
+        for (int k = 0; k < 6; ++k) {
+            b[at[k]] = uint8_t(versions[k]);
+            b[at[k] + 1] = uint8_t(versions[k] >> 8);
+        }
+        how = "a DualShock 4 firmware description";
+    } else if (id == 0x12 || id == 0x81) {
+        if (read_feature(0x09, 20)) {
+            std::memcpy(b + 1, source + 1, 6);
+            how = "the DualSense's address (0x09)";
+        }
+    }
+    static std::atomic<uint32_t> seen[8];
+    bool fresh = true;
+    for (auto& v : seen) {
+        uint32_t expected = 0;
+        if (v.load() == id + 1u) { fresh = false; break; }
+        if (v.compare_exchange_strong(expected, id + 1u)) break;
+    }
+    if (fresh)
+        log("nativepad: DualShock 4 feature report 0x%02X (buffer %lu bytes) asked by the game: answered with %s", id, length, how);
+    if (!ok) SetLastError(ERROR_INVALID_PARAMETER);
+    return ok;
+}
+
+BOOLEAN __stdcall hk_set_feature(HANDLE h, PVOID buffer, ULONG length) {
+    if (ds4_device(h) >= 0) {
+        static std::atomic<int> count{0};
+        if (++count <= 5)
+            log("nativepad: DualShock 4 feature report 0x%02X sent by the game: not passed to the DualSense",
+                buffer && length ? static_cast<uint8_t*>(buffer)[0] : 0);
+        return TRUE;
+    }
+    Feature_t real = original(g_set_feature, "HidD_SetFeature", "hid.dll");
+    return real ? real(h, buffer, length) : FALSE;
+}
+
+// Preparsed data of a DualSense shown as a DualShock 4: HidP_GetCaps then reports the DualShock 4's USB lengths.
+std::mutex g_preparsed_mutex;
+PHIDP_PREPARSED_DATA g_preparsed[8];
+
+BOOLEAN __stdcall hk_get_preparsed(HANDLE h, PHIDP_PREPARSED_DATA* data) {
+    GetPreparsedData_t real = original(g_get_preparsed, "HidD_GetPreparsedData", "hid.dll");
+    const BOOLEAN ok = real ? real(h, data) : FALSE;
+    if (ok && data && *data && ds4_device(h) >= 0) {
+        std::lock_guard lock(g_preparsed_mutex);
+        for (auto& p : g_preparsed)
+            if (!p) { p = *data; break; }
+    }
+    return ok;
+}
+
+BOOLEAN __stdcall hk_free_preparsed(PHIDP_PREPARSED_DATA data) {
+    {
+        std::lock_guard lock(g_preparsed_mutex);
+        for (auto& p : g_preparsed)
+            if (p == data) p = nullptr;
+    }
+    FreePreparsedData_t real = original(g_free_preparsed, "HidD_FreePreparsedData", "hid.dll");
+    return real ? real(data) : FALSE;
+}
+
+bool is_ds4_preparsed(PHIDP_PREPARSED_DATA data) {
+    std::lock_guard lock(g_preparsed_mutex);
+    for (auto& p : g_preparsed)
+        if (p && p == data) return true;
+    return false;
+}
+
+// The DualShock 4's feature reports as Sony's PC library checks them in the device's value caps before accepting it:
+// (usage page, usage, report ID, report count in bytes). The library also wants many of them (at least 19), so the
+// list carries the DualShock 4's other vendor feature reports too.
+struct FeatureCap {
+    USHORT page, usage;
+    UCHAR id;
+    USHORT count;
+};
+constexpr FeatureCap kDs4Features[] = {
+    {0xFF00, 0x24, 0x02, 0x24}, {0xFF80, 0x43, 0xA3, 0x30}, {0xFF02, 0x21, 0x12, 0x0F}, {0xFF02, 0x22, 0x13, 0x16},
+    {0xFF05, 0x20, 0x14, 0x10}, {0xFF05, 0x21, 0x15, 0x2C}, {0xFF80, 0x20, 0x80, 0x06}, {0xFF80, 0x21, 0x81, 0x06},
+    {0xFF80, 0x22, 0x82, 0x05}, {0xFF80, 0x23, 0x83, 0x01}, {0xFF80, 0x24, 0x84, 0x04}, {0xFF80, 0x25, 0x85, 0x06},
+    {0xFF80, 0x26, 0x86, 0x06}, {0xFF80, 0x27, 0x87, 0x23}, {0xFF80, 0x28, 0x88, 0x22}, {0xFF80, 0x29, 0x89, 0x02},
+    {0xFF80, 0x30, 0x90, 0x05}, {0xFF80, 0x31, 0x91, 0x03}, {0xFF80, 0x32, 0x92, 0x03}, {0xFF80, 0x33, 0x93, 0x0C},
+    {0xFF80, 0x40, 0xA0, 0x06}, {0xFF80, 0x41, 0xA1, 0x01}, {0xFF80, 0x42, 0xA2, 0x01}, {0xFF80, 0x44, 0xA4, 0x0D},
+    {0xFF80, 0x57, 0xE1, 0x30}, {0xFF80, 0x57, 0xE3, 0x04}, {0xFF80, 0x57, 0xF0, 0x10}};
+constexpr USHORT kDs4FeatureCount = USHORT(std::size(kDs4Features));
+
+NTSTATUS __stdcall hk_get_caps(PHIDP_PREPARSED_DATA data, PHIDP_CAPS caps) {
+    GetCaps_t real = original(g_get_caps, "HidP_GetCaps", "hid.dll");
+    const NTSTATUS status = real ? real(data, caps) : HIDP_STATUS_INVALID_PREPARSED_DATA;
+    if (status == HIDP_STATUS_SUCCESS && caps && data && is_ds4_preparsed(data)) {
+        caps->InputReportByteLength = 64;
+        caps->OutputReportByteLength = 32;
+        caps->FeatureReportByteLength = 64;
+        caps->NumberFeatureButtonCaps = 0;
+        caps->NumberFeatureValueCaps = kDs4FeatureCount;
+        caps->NumberFeatureDataIndices = kDs4FeatureCount;
+    }
+    return status;
+}
+
+NTSTATUS __stdcall hk_get_value_caps(HIDP_REPORT_TYPE type, PHIDP_VALUE_CAPS value_caps, PUSHORT length,
+                                     PHIDP_PREPARSED_DATA data) {
+    GetValueCaps_t real = original(g_get_value_caps, "HidP_GetValueCaps", "hid.dll");
+    if (type != HidP_Feature || !length || !data || !is_ds4_preparsed(data))
+        return real ? real(type, value_caps, length, data) : HIDP_STATUS_INVALID_PREPARSED_DATA;
+    const USHORT room = value_caps ? *length : 0;
+    const USHORT n = std::min(room, kDs4FeatureCount);
+    for (USHORT k = 0; k < n; ++k) {
+        HIDP_VALUE_CAPS& c = value_caps[k];
+        std::memset(&c, 0, sizeof c);
+        c.UsagePage = kDs4Features[k].page;
+        c.ReportID = kDs4Features[k].id;
+        c.BitSize = 8;
+        c.ReportCount = kDs4Features[k].count;
+        c.LogicalMax = 255;
+        c.PhysicalMax = 255;
+        c.IsAbsolute = TRUE;
+        c.LinkUsage = 5;
+        c.LinkUsagePage = 1;
+        c.NotRange.Usage = kDs4Features[k].usage;
+        c.NotRange.DataIndex = k;
+    }
+    *length = kDs4FeatureCount;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        log("nativepad: DualShock 4 feature value caps (%u) given to the game (room for %u)", unsigned(kDs4FeatureCount), unsigned(room));
+    return room >= kDs4FeatureCount ? HIDP_STATUS_SUCCESS : HIDP_STATUS_BUFFER_TOO_SMALL;
+}
+
+// A DualShock 4 USB output report (0x05: flags, right/weak and left/strong motor at 4-5, light bar RGB at 6-8) sent to
+// a DualSense as its output report (USB 0x02: enable bits 1-2, motors 3-4, light bar RGB 45-47; Bluetooth 0x31, see
+// below). Written with our own buffer; the game's request is completed as written in full. Other reports are dropped.
+BOOL WINAPI hk_write_file(HANDLE h, LPCVOID buffer, DWORD size, LPDWORD written, LPOVERLAPPED ol) {
+    WriteFile_t real = original(g_write_file, "WriteFile", "kernel32.dll");
+    const int i = g_as_ds4 ? ds4_device(h) : -1;
+    if (i < 0 || !buffer || !size) return real ? real(h, buffer, size, written, ol) : FALSE;
+    Device& d = g_devices[i];
+    const auto* in = static_cast<const uint8_t*>(buffer);
+    const DWORD length = std::min<DWORD>(d.output_length ? d.output_length : (d.bluetooth ? 78 : 48), sizeof d.out);
+    const uint8_t id = d.bluetooth ? 0x31 : 0x02;
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 3)
+        log("nativepad: DualShock 4 output report 0x%02X (%lu bytes) from the game -> DualSense report 0x%02X (%lu bytes)%s",
+            in[0], size, id, length, in[0] == 0x05 ? "" : ": not a USB output report, dropped");
+    BOOL ok = TRUE;
+    if (in[0] == 0x05 && size >= 11 && length >= (d.bluetooth ? 78u : 48u) && real) {
+        // Over Bluetooth: 0x31, a 0x02 tag, the same effects block one byte later, CRC32 (seed 0xA2) at 74.
+        uint8_t* out = d.out;
+        std::memset(out, 0, length);
+        out[0] = id;
+        const int base = d.bluetooth ? 2 : 1;
+        if (d.bluetooth) out[1] = 0x02;
+        if (in[1] & 0x01) {
+            out[base] = 0x03;  // rumble (compatible vibration)
+            out[base + 2] = in[4];
+            out[base + 3] = in[5];
+        }
+        if (in[1] & 0x02) {
+            out[base + 1] = 0x04;  // light bar colour
+            out[base + 44] = in[6];
+            out[base + 45] = in[7];
+            out[base + 46] = in[8];
+        }
+        if (d.bluetooth) {
+            const uint32_t crc = report_crc(out, 74, 0xA2);
+            for (int k = 0; k < 4; ++k) out[74 + k] = uint8_t(crc >> (8 * k));
+        }
+        DWORD done = 0;
+        if (ol) {
+            OVERLAPPED mine{};
+            mine.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            ok = real(h, out, length, nullptr, &mine);
+            if (!ok && GetLastError() == ERROR_IO_PENDING) {
+                if (WaitForSingleObject(mine.hEvent, 200) != WAIT_OBJECT_0) CancelIoEx(h, &mine);
+                GetOverlappedResult_t get = original(g_get_overlapped, "GetOverlappedResult", "kernel32.dll");
+                ok = get && get(h, &mine, &done, TRUE);
+            }
+            if (mine.hEvent) CloseHandle(mine.hEvent);
+        } else {
+            ok = real(h, out, length, &done, nullptr);
+        }
+    }
+    // Completed as far as the game knows (a failed rumble write isn't worth an error in its controller code).
+    if (ol) {
+        ol->Internal = 0;
+        ol->InternalHigh = size;
+        if (ol->hEvent) SetEvent(ol->hEvent);
+    }
+    if (written) *written = size;
+    SetLastError(ERROR_SUCCESS);
+    (void)ok;
+    return TRUE;
+}
+
 BOOL WINAPI hk_close_handle(HANDLE h) {
     if (g_device_count.load(std::memory_order_relaxed) && find_device(h) >= 0) untrack(h);
     CloseHandle_t real = original(g_close_handle, "CloseHandle", "kernel32.dll");
@@ -383,14 +838,28 @@ BOOL WINAPI hk_close_handle(HANDLE h) {
 
 }  // namespace
 
-void install(bool suppression) {
+void install(bool suppression, bool dualsense_as_ds4) {
     if (hooks::inline_mode()) {
         log("nativepad: not available for this game (protected exe, no import-table hooks)");
         return;
     }
     g_suppression = suppression;
+    g_as_ds4 = dualsense_as_ds4;
+    g_follow = true;  // DualSense handles are always followed: does the game read the one it opens?
     hooks::add_with_pad_library(nullptr, "CreateFileW", reinterpret_cast<void*>(&hk_create_file), reinterpret_cast<void**>(&g_create_file));
-    if (suppression) {
+    if (dualsense_as_ds4) {
+        auto add = [](const char* function, void* hook, void** slot) { hooks::add_with_pad_library(nullptr, function, hook, slot); };
+        add("HidD_GetAttributes", reinterpret_cast<void*>(&hk_get_attributes), reinterpret_cast<void**>(&g_get_attributes));
+        add("HidD_GetProductString", reinterpret_cast<void*>(&hk_get_product), reinterpret_cast<void**>(&g_get_product));
+        add("HidD_GetFeature", reinterpret_cast<void*>(&hk_get_feature), reinterpret_cast<void**>(&g_get_feature));
+        add("HidD_SetFeature", reinterpret_cast<void*>(&hk_set_feature), reinterpret_cast<void**>(&g_set_feature));
+        add("HidD_GetPreparsedData", reinterpret_cast<void*>(&hk_get_preparsed), reinterpret_cast<void**>(&g_get_preparsed));
+        add("HidD_FreePreparsedData", reinterpret_cast<void*>(&hk_free_preparsed), reinterpret_cast<void**>(&g_free_preparsed));
+        add("HidP_GetCaps", reinterpret_cast<void*>(&hk_get_caps), reinterpret_cast<void**>(&g_get_caps));
+        add("HidP_GetValueCaps", reinterpret_cast<void*>(&hk_get_value_caps), reinterpret_cast<void**>(&g_get_value_caps));
+        add("WriteFile", reinterpret_cast<void*>(&hk_write_file), reinterpret_cast<void**>(&g_write_file));
+    }
+    if (g_follow) {
         hooks::add_with_pad_library(nullptr, "ReadFile", reinterpret_cast<void*>(&hk_read_file), reinterpret_cast<void**>(&g_read_file));
         hooks::add_with_pad_library(nullptr, "GetOverlappedResult", reinterpret_cast<void*>(&hk_get_overlapped),
                                     reinterpret_cast<void**>(&g_get_overlapped));
@@ -401,9 +870,22 @@ void install(bool suppression) {
     log("settings: NativeFlickStick=%d (%s)", suppression ? 1 : 0,
         suppression ? "flick stick also with the game's own PlayStation controller support, once its reports are checked"
                     : "flick stick only while the controller is shown as an Xbox one");
+    log("settings: DualSenseAsDualShock4=%d%s", dualsense_as_ds4 ? 1 : 0,
+        dualsense_as_ds4 ? " (a DualSense, USB or Bluetooth, is shown to the game's own PlayStation support as a USB DualShock 4)" : "");
 }
 
 void refuse_pads(bool refuse) { g_refuse = refuse; }
+
+uint16_t hid_path_id(const wchar_t* path, const wchar_t* key) { return path ? path_id(path, key) : 0; }
+
+bool dualsense_ignored() {
+    if (g_as_ds4 || g_dualsense_read) return false;
+    const ULONGLONG opened = g_dualsense_opened;
+    if (!opened || GetTickCount64() - opened < 5000) return false;
+    for (Device& d : g_devices)  // a DualSense handle still open: the game took it (it may read it later)
+        if (d.handle.load(std::memory_order_acquire) && is_dualsense(d.vendor, d.product)) return false;
+    return true;
+}
 
 bool opened_vendor(uint16_t vendor) {
     if (!vendor) return false;
@@ -415,6 +897,7 @@ bool opened_vendor(uint16_t vendor) {
 bool frame(SDL_Gamepad* pad, bool suppress) {
     const uint32_t ids = pad ? uint32_t(SDL_GetGamepadVendor(pad)) << 16 | SDL_GetGamepadProduct(pad) : 0;
     g_pad_ids = ids;
+
 
     // The layout is trusted once the right stick in the game's reports agrees with SDL's while the stick is held
     // away from the centre; a clear disagreement turns suppression off for this controller.

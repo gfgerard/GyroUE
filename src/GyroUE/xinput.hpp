@@ -16,7 +16,15 @@ struct Settings {
     int mode = Auto;
     bool nintendo_labels = false;  // swap face buttons A<->B and X<->Y (Nintendo A = Xbox A) instead of by position
     bool touchpad_back = true;     // touchpad click also presses View (Back), like the Create/Share button
+    bool trace = false;            // XInputTrace: log every module that calls XInput (inline hooks on the system DLLs)
 };
+
+// The game links Sony's pad library (auto mode's check: libScePad or hid.dll among its imports, or libScePad loaded).
+bool sony_library();
+
+// Game thread: posts WM_DEVICECHANGE (DBT_DEVNODES_CHANGED) to the game's UnrealWindows, as Windows does when a
+// controller is plugged in or out: Unreal (and Sony's pad libraries linked into it) then look for controllers again.
+void announce_device_change();
 
 // DllMain, after hooks::init: registers the hooks the mode needs (none for Off).
 void install(const Settings& settings);

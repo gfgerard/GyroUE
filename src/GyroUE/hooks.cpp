@@ -31,6 +31,15 @@ struct Hook {
 std::recursive_mutex g_mutex;
 std::vector<Hook> g_hooks;
 std::set<std::pair<HMODULE, size_t>> g_done;  // (module, hook index) already patched
+// Every import slot patched, to notice when something else writes it back (verify()).
+struct Patched {
+    ULONGLONG* slot;
+    void* replacement;
+    const char* function;
+    std::string dll;
+    bool reported = false;
+};
+std::vector<Patched> g_patched;
 std::wstring g_prefix;                        // lower-case "<project>-"
 // The exe's import table is a protector stub (no name tables; the real imports are resolved later by
 // the protector, after DllMain), so hooks on a named DLL go inline on that DLL's export instead.
@@ -148,6 +157,7 @@ bool patch_slots(HMODULE module, const char* dll, const IMAGE_THUNK_DATA64* name
         if (!VirtualProtect(&slots->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) continue;
         slots->u1.Function = reinterpret_cast<ULONGLONG>(hook.replacement);
         VirtualProtect(&slots->u1.Function, sizeof(void*), old, &old);
+        g_patched.push_back({&slots->u1.Function, hook.replacement, hook.function, dll});
         if (hook.from.empty()) hook.from = dll;
         if (delay || hook.ordinal)
             log("hooks: %s!%s%s patched in the %s table of module %p%s", dll, hook.function,
@@ -369,6 +379,36 @@ bool add_with_pad_library(const char* dll, const char* function, void* replaceme
 }
 
 bool inline_mode() { return g_inline; }
+
+// Only the XInput imports are taken back: without them the translated controller never reaches the game (Mortal
+// Shell: the Epic Online Services overlay, EOSOVH-Win64-Shipping.dll, rewrites them after GyroUE patched them). Other
+// imports (LoadLibrary*) are left to whoever rewrote them, so an overlay keeps its own hooks; that is logged once.
+int verify() {
+    std::lock_guard lock(g_mutex);
+    int fixed = 0;
+    for (Patched& p : g_patched) {
+        const ULONGLONG now = *p.slot;
+        if (now == reinterpret_cast<ULONGLONG>(p.replacement)) continue;
+        const bool reclaim = std::strncmp(p.function, "XInput", 6) == 0;
+        if (!p.reported)
+            log("hooks: the import of %s!%s was written back by something else (now %s); %s", p.dll.c_str(), p.function,
+                describe(reinterpret_cast<void*>(now)).c_str(), reclaim ? "patched again" : "left to it");
+        p.reported = true;
+        if (!reclaim) continue;
+        DWORD old = 0;
+        if (!VirtualProtect(p.slot, sizeof(void*), PAGE_READWRITE, &old)) continue;
+        *p.slot = reinterpret_cast<ULONGLONG>(p.replacement);
+        VirtualProtect(p.slot, sizeof(void*), old, &old);
+        ++fixed;
+    }
+    return fixed;
+}
+
+bool hook_function(void* target, void* replacement, void** original) {
+    static const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) return false;
+    return target && MH_CreateHook(target, replacement, original) == MH_OK && MH_EnableHook(target) == MH_OK;
+}
 
 std::string source_dll(const char* function) {
     std::lock_guard lock(g_mutex);

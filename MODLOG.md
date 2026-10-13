@@ -1118,6 +1118,90 @@ or gyro to stick.
     suppression was withdrawn.
   - Still to verify: Bluetooth (reports `0x31` + CRC), DualShock 4, a game with the separate DLL over Bluetooth.
 
+- 2026-10-13 **Mortal Shell (Epic, UE 4.25+, exe `Dungeonhaven-Win64-Shipping.exe`): DualSense shown as a DualShock 4
+  (`DualSenseAsDualShock4=1`, new in `nativepad.cpp`, USB only). Works in game (user: almost every button checked).**
+  - Why: the game links an old Sony PC pad library (`WinDualShock` plugin, same `hid.dll` imports as `libScePad.dll`)
+    that knows only the DualShock 4 (PID 05C4 x147 / 09CC x43 / 0CE6 x8 in the exe). It opens the DualSense for reading
+    but ignores it. `XInput=2` can't help: the game never calls `XInputGetState` while its Sony plugin is active (the
+    exe's only call site, UE's `XInputInterface::SendControllerEvents`, never ran, even with a real XInput pad that the
+    game does use some other way; not investigated further).
+  - What the library checks before accepting a DualShock 4 (disassembly of the exe): `HidD_GetAttributes` PID;
+    `HidP_GetCaps` Input >= 64, Feature >= 0x35; feature value caps (`HidP_GetValueCaps(HidP_Feature)`) must contain
+    (page 0xFF80, usage 0x43, report 0xA3, count 0x30) and no (0xFF04, 0x27, 0x06, 0x34) entry, and a device field
+    >= 0x13 (probably the feature caps count); feature 0x12 (address, 16-byte buffer), 0xA3 (firmware, 49: hardware
+    version LE16 at 0x23 must be >= 0x3100; date/time strings at 1/17, other versions at 0x21/0x25/0x29/0x2B/0x2D),
+    `SetFeature 0x14`, feature 0x02 (calibration, 37). On rejection its cleanup path frees uninitialised pointers:
+    heap corruption crash (0xC0000374). First crash also had GyroUE zero-filling the caller's whole stated buffer
+    length: now only the DualShock 4 report size is written.
+  - Emulation: identity 054C:09CC "Wireless Controller"; caps 64/32/64 with 27 synthetic feature value caps; 0x02 from
+    the DualSense's 0x05 (same layout), 0x12/0x81 address from 0x09, 0xA3 synthetic; other IDs fail; SetFeature
+    swallowed. Input: each 64-byte DualSense report rewritten in place as a DualShock 4 USB report (sticks, buttons,
+    triggers, IMU, timestamp /16, touch, cable/battery). Output: DS4 0x05 (motors 4-5, RGB 6-8) -> DualSense 0x02
+    (48 bytes: enable bits, motors 3-4, RGB 45-47) with GyroUE's own buffer; the game's request completed as written.
+  - Log: game reads 7 x 64-byte reports per synchronous `ReadFile`; layout check for native flick passed (15/15).
+  - Diagnostics added on the way (kept): `input:` lines for every Raw Input registration, HID device opened (with or
+    without read access) and HID device the game gets Raw Input reports from; every followed HID handle's first read.
+  - **Bluetooth works too (user: functions checked).** Over Bluetooth the game first skipped the pad: the library
+    accepts 054C:05C4/09CC only with `HidD_GetAttributes` VersionNumber, read as decimal digits, >= 23 (a USB DualSense
+    passes; Windows reports 0x0000 over Bluetooth), so the emulation now reports 0x0100. The game's buffers use the
+    spoofed 64-byte input length while the device's is 78: GyroUE reads into its own buffer (same report count) and
+    converts 0x31 (USB layout shifted by one; 0x01 basic report also handled). Output: 0x31, tag 0x02, effects one
+    byte later than USB, CRC32 seed 0xA2 at 74; the device's output length is 547. Feature reads use the device's
+    feature length over Bluetooth. Log: 8 x 64 bytes per synchronous read after conversion, layout check 15/15.
+  - Profile `profiles/Dungeonhaven-Win64-Shipping.ini`: `[GyroUE] DualSenseAsDualShock4=1`, generic camera (confirmed
+    in game: `camera: confirmed ... ControlRotation`). No settings panel (DX11).
+  - To do: Jedi: Fallen Order (same library imports).
+
+- 2026-10-13 **Auto mode: Sony-library signs only apply to PlayStation controllers (not tested in game yet).** Before,
+  a game importing `libScePad`/`hid.dll` (Hogwarts, Cronos, Mortal Shell, Jedi) also kept a Switch Pro or a DirectInput
+  pad from being translated, though its Sony library ignores them: no input, no Xbox prompts. Now `native_sign` keeps
+  two kinds: Sony (libScePad imported/loaded, hid.dll imported) blocks only vendor 054C; Any (own SDL, Raw Input
+  gamepad registration, DirectInput, the game opening the pad's HID device) blocks every pad. The HID-open sign is
+  ignored when a Sony library is present: its enumeration opens every HID device for reading (Mortal Shell log:
+  keyboards, lighting controllers). Caveat: in games that never call XInputGetState while their Sony plugin is active
+  (Mortal Shell) the translated pad got no input: that was the EOS overlay undoing GyroUE's XInput hook (fixed, see below).
+  - **Jedi: Fallen Order (Steam), Switch Pro, `XInput=1`: works (user).** Log: `the game reads PlayStation controllers
+    itself: it imports the HID library`, then `Nintendo Switch Pro Controller shown as XInput controller 0`, game polls
+    XInputGetState 8 s later; its Sony library opens 057E:2009 once while enumerating and closes it. Jedi reads XInput
+    alongside its Sony library (unlike Mortal Shell). The earlier DualSense-as-DualShock 4 test there (user, log not
+    kept) also worked.
+
+- 2026-10-13 **Mortal Shell: XInput translation works; the Epic Online Services overlay was undoing GyroUE's hook.**
+  Switch Pro, `XInput=1`: shown as Xbox controller and the game responds (user: works perfectly).
+  - Correction of the earlier finding: the game does poll XInput (UE's `XInputInterface`, call at exe+0xE7FA3B) all the
+    time. `XInputTrace=1` (new diagnostic: MinHook inline hooks on `XInputGetState`/`Ex` in every loaded xinput DLL,
+    each calling module logged once) showed the exe calling `xinput1_3!XInputGetState` directly, not through GyroUE.
+  - Cause: `EOSOVH-Win64-Shipping.dll` (EOS overlay) rewrites the exe's import slots for `XInputGetState` and
+    `LoadLibraryW/A/ExW/ExA` about 2 s after start, after GyroUE patched them (its XInput hook tail-jumps to the real
+    export, so the return address stays in the exe). The DSX-emulated Xbox pad worked because it is a real XInput pad.
+  - Fix: `hooks::verify()` (watcher thread, every second) checks every slot GyroUE patched; a rewritten slot is logged
+    once with its new target and, for XInput imports only, patched again (`patched again` / `left to it`). Our hook
+    keeps calling the real export, so EOS's XInput hook is bypassed (overlay gamepad input not checked).
+  - Log: `hooks: the import of XINPUT1_3.dll!XInputGetState was written back by something else (now
+    EOSOVH-Win64-Shipping.dll+0x251d0); patched again`, then `the game polls XInputGetState` 0.9 s later and
+    `Nintendo Switch Pro Controller shown as XInput controller 0`.
+  - Any EOS game (Epic Store) can do this; before the fix the translation silently never reached them.
+
+- 2026-10-13 **DualSense as DualShock 4 is now learned, not a user setting. Tested in Mortal Shell (DualSense over
+  Bluetooth, no profile, auto mode): first start showed the notice and the DualSense worked as an Xbox controller
+  (user); GyroUE created `GyroUE\profiles\Dungeonhaven-Win64-Shipping.ini` with its header and the key; second start
+  loaded it (`1 view(s)`, generic camera) and the game used the DualSense as a DualShock 4 (calibration, rumble and
+  light bar to report 0x31, converted reads).**
+  - Experiment B (switch identity in the same session), Mortal Shell, DualSense over Bluetooth: started with the real
+    identity; 5 s after the game's look (open, HidD_GetAttributes, close) GyroUE refused its opens for 3 s, then showed
+    the DS4 identity. The game never opened the DualSense again (0 refusals), also with `WM_DEVICECHANGE`
+    (DBT_DEVNODES_CHANGED) posted to its window at both steps: its Sony library only looks for controllers at startup
+    (two passes 0.5 s apart; the exe imports no RegisterDeviceNotification). Dead end without RE of its scan loop.
+  - Option C: `nativepad::dualsense_ignored()` = the game opened a DualSense, never read one, and has none open 5 s
+    after the first open (a supporting library keeps its handle and reads at once: Pacific Drive 0.5 s, Cronos 20 ms).
+    With a Sony library among the imports (`xinput::sony_library()`, auto mode), the host writes
+    `[GyroUE] DualSenseAsDualShock4=1` into `GyroUE\profiles\<exe>.ini` (created with a header if missing), shows a
+    15 s notice (restart to use it as a PlayStation controller) and the auto mode translates that DualSense to XInput
+    for the session. `DualSenseAsDualShock4` left GyroUE.ini and the user docs; it stays a profile key.
+  - The probe now keeps the profile's `[GyroUE]` section when it rewrites the profile, and a profile without camera
+    views (no `[View.Default]`, no `Views`) doesn't count as an existing profile for it.
+  - DualSense handles are now always followed (read hooks always installed), to see whether the game reads them.
+
 ## Status summary (2026-10-08)
 - Pacific Drive: **done** (on foot + car profile, in-game panel, calibration). Install:
   `games/PacificDrive/deploy-gyroue.sh "<Win64 dir>"`; uninstall with `remove`. UE4SS is parked as `dwmapi.dll.off`.

@@ -14,6 +14,8 @@
 #include <gyrolib/runtime.h>
 #include <gyrolib/sdl.h>
 
+#include <intrin.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -32,6 +34,7 @@ using SetState_t = DWORD(WINAPI*)(DWORD, XINPUT_VIBRATION*);
 using GetCaps_t = DWORD(WINAPI*)(DWORD, DWORD, XINPUT_CAPABILITIES*);
 using Enable_t = void(WINAPI*)(BOOL);
 using RegisterRawInputDevices_t = BOOL(WINAPI*)(PCRAWINPUTDEVICE, UINT, UINT);
+using GetRawInputData_t = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
 using DirectInput8Create_t = HRESULT(WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*, void*);
 
 Settings g_settings;
@@ -44,6 +47,7 @@ SetState_t g_set_state = nullptr;
 GetCaps_t g_get_caps = nullptr;
 Enable_t g_enable = nullptr;
 RegisterRawInputDevices_t g_register_raw = nullptr;
+GetRawInputData_t g_get_raw_data = nullptr;
 DirectInput8Create_t g_di8_create = nullptr;
 
 // The original of an import: from the hook, else from the DLL the game imports it from (loaded on demand; never
@@ -73,21 +77,25 @@ std::atomic<bool> g_game_polls{false};        // the game called XInputGetState 
 
 // ------------------------------------------------------------------ native pad support (Auto mode)
 
+// Two kinds of signs. A Sony pad library (libScePad, linked in or not; hid.dll among the imports means the same in
+// these games) only reads PlayStation controllers: an Xbox-less DirectInput pad or a Switch Pro controller still needs
+// the translation there. An own SDL, Raw Input for game controllers or DirectInput read any controller.
+enum Sign { Sony = 0, Any = 1 };
 std::mutex g_native_mutex;
-std::string g_native_reason;                  // first sign that the game reads pads itself ("" = none)
-std::atomic<bool> g_native{false};
+std::string g_native_reason[2];               // first sign of each kind ("" = none)
+std::atomic<bool> g_native[2] = {false, false};
 
-void native_sign(const std::string& reason) {
+void native_sign(const std::string& reason, Sign kind = Any) {
     std::lock_guard lock(g_native_mutex);
-    if (!g_native_reason.empty()) return;
-    g_native_reason = reason;
-    g_native = true;
-    log("xinput: the game reads controllers itself: %s", reason.c_str());
+    if (!g_native_reason[kind].empty()) return;
+    g_native_reason[kind] = reason;
+    g_native[kind] = true;
+    log("xinput: the game reads %s itself: %s", kind == Sony ? "PlayStation controllers" : "controllers", reason.c_str());
 }
 
-std::string native_reason() {
+std::string native_reason(Sign kind) {
     std::lock_guard lock(g_native_mutex);
-    return g_native_reason;
+    return g_native_reason[kind];
 }
 
 // ------------------------------------------------------------------ hooks (any game thread)
@@ -167,6 +175,8 @@ BOOL WINAPI hk_register_raw(PCRAWINPUTDEVICE devices, UINT count, UINT size) {
     };
     std::vector<RAWINPUTDEVICE> kept;
     for (UINT i = 0; i < count; ++i) {
+        log("input: the game registers Raw Input usage page 0x%X usage 0x%X flags 0x%lX", unsigned(devices[i].usUsagePage),
+            unsigned(devices[i].usUsage), devices[i].dwFlags);
         if (!pad(devices[i])) {
             kept.push_back(devices[i]);
         } else if (g_settings.mode == Auto) {
@@ -178,6 +188,35 @@ BOOL WINAPI hk_register_raw(PCRAWINPUTDEVICE devices, UINT count, UINT size) {
     }
     if (g_settings.mode != Always || kept.size() == count) return real(devices, count, size);
     return kept.empty() ? TRUE : real(kept.data(), UINT(kept.size()), sizeof(RAWINPUTDEVICE));
+}
+
+// Diagnostics: each HID device (not mouse/keyboard) the game receives Raw Input reports from, once.
+UINT WINAPI hk_get_raw_data(HRAWINPUT input, UINT command, LPVOID data, PUINT size, UINT header_size) {
+    GetRawInputData_t real = original(g_get_raw_data, "GetRawInputData", "user32.dll");
+    const UINT result = real ? real(input, command, data, size, header_size) : UINT(-1);
+    if (data && command == RID_INPUT && result != UINT(-1) && result >= sizeof(RAWINPUTHEADER) &&
+        static_cast<const RAWINPUT*>(data)->header.dwType == RIM_TYPEHID) {
+        const DWORD error = GetLastError();
+        static std::mutex mutex;
+        static HANDLE seen[8];
+        static int count = 0;
+        const HANDLE device = static_cast<const RAWINPUT*>(data)->header.hDevice;
+        bool fresh = true;
+        {
+            std::lock_guard lock(mutex);
+            for (int i = 0; i < count; ++i) fresh = fresh && seen[i] != device;
+            if (fresh && count < 8) seen[count++] = device;
+        }
+        if (fresh) {
+            wchar_t name[512] = {};
+            UINT length = 512;
+            GetRawInputDeviceInfoW(device, RIDI_DEVICENAME, name, &length);
+            log("input: the game reads Raw Input reports from HID device %04X:%04X", nativepad::hid_path_id(name, L"vid"),
+                nativepad::hid_path_id(name, L"pid"));
+        }
+        SetLastError(error);
+    }
+    return result;
 }
 
 HRESULT WINAPI hk_di8_create(HINSTANCE instance, DWORD version, REFIID iid, LPVOID* out, void* outer) {
@@ -198,31 +237,28 @@ std::atomic<HMODULE> g_our_sdl{nullptr};
 // Choice) only loads on the game's first scePad call, possibly after the grace period, so the import itself counts.
 // Same for hid.dll: Hogwarts Legacy opened the DualSense's HID device 15 s after the pad was shown as XInput.
 void check_imports() {
-    if (g_native) return;
+    if (g_native[Sony] && g_native[Any]) return;
     for (const hooks::ImportedDll& dll : hooks::imported_dlls()) {
         std::string name = dll.name;
         for (char& c : name) c = char(std::tolower(static_cast<unsigned char>(c)));
         const char* how = dll.delay ? ", delay-load" : "";
         if (name.rfind("libscepad", 0) == 0) {
-            native_sign("it imports Sony's pad library (" + dll.name + how + ", native DualSense support)");
-            return;
+            native_sign("it imports Sony's pad library (" + dll.name + how + ", native DualSense support)", Sony);
         }
         if (name == "sdl2.dll" || name == "sdl3.dll") {
             native_sign("it imports its own SDL (" + dll.name + how + ")");
-            return;
         }
-        // Stock Unreal doesn't import hid.dll; a game that does talks to HID controllers itself (Hogwarts Legacy:
-        // HidD_GetFeature/SetFeature, native DualSense). UE's RawInput plugin imports it too, also native support.
-        if (name == "hid.dll") {
-            native_sign("it imports the HID library (" + dll.name + how + ", reads controllers directly)");
-            return;
-        }
+        // Stock Unreal doesn't import hid.dll; the games that do link Sony's pad library (Hogwarts Legacy, Cronos,
+        // Mortal Shell, Jedi: Fallen Order: the same HidD_* set as libScePad.dll). UE's RawInput plugin imports it too,
+        // but it also registers Raw Input for game controllers, a sign for any controller.
+        if (name == "hid.dll")
+            native_sign("it imports the HID library (" + dll.name + how + ", Sony's pad library)", Sony);
     }
 }
 
 void scan_modules() {
     check_imports();  // modules loaded since the last pass
-    if (g_native) return;
+    if (g_native[Sony] && g_native[Any]) return;
     HMODULE mods[2048];
     DWORD needed = 0;
     if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) return;
@@ -233,14 +269,85 @@ void scan_modules() {
         for (wchar_t* c = name; *c; ++c) *c = wchar_t(std::towlower(*c));
         const std::wstring n2 = name;
         if (n2.rfind(L"libscepad", 0) == 0) {
-            native_sign("it loads Sony's pad library (" + narrow(n2) + ", native DualSense support)");
-            return;
+            native_sign("it loads Sony's pad library (" + narrow(n2) + ", native DualSense support)", Sony);
         }
         if ((n2 == L"sdl2.dll" || n2 == L"sdl3.dll") && mods[i] != g_our_sdl.load()) {
             native_sign("it loads its own SDL (" + narrow(n2) + ")");
-            return;
         }
     }
+}
+
+// ------------------------------------------------------------------ XInputTrace (diagnostics)
+
+// Every XInput DLL in the process gets inline hooks on XInputGetState (and XInputGetStateEx where it exists), so calls
+// that don't go through a game module's import table (another module, GetProcAddress) show up too. Each calling module
+// is logged once, with the first call's return address. GyroUE's own calls (the watcher) and GyroLib's are marked.
+const char* const kTraceDlls[] = {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll", "xinputuap.dll"};
+constexpr int kTraceSlots = 8;  // dll * 2 (GetState, GetStateEx)
+GetState_t g_trace_original[kTraceSlots] = {};
+bool g_trace_hooked[kTraceSlots] = {};
+
+void note_caller(int slot, void* return_address) {
+    static std::mutex mutex;
+    static std::pair<int, HMODULE> seen[48];
+    static int count = 0;
+    HMODULE caller = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       static_cast<LPCWSTR>(return_address), &caller);
+    {
+        std::lock_guard lock(mutex);
+        for (int i = 0; i < count; ++i)
+            if (seen[i].first == slot && seen[i].second == caller) return;
+        if (count < 48) seen[count++] = {slot, caller};
+    }
+    wchar_t path[MAX_PATH] = L"(no module: generated code)";
+    if (caller) GetModuleFileNameW(caller, path, MAX_PATH);
+    std::wstring name = path;
+    name = name.substr(name.find_last_of(L"\\/") + 1);
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&note_caller), &self);
+    log("xinput trace: %s!%s called from %s+0x%llx%s", kTraceDlls[slot / 2], slot % 2 ? "XInputGetStateEx" : "XInputGetState",
+        narrow(name).c_str(),
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(return_address) - reinterpret_cast<uintptr_t>(caller)),
+        caller == self ? " (GyroUE itself)" : "");
+}
+
+template <int Slot>
+DWORD WINAPI trace_get_state(DWORD user, XINPUT_STATE* state) {
+    note_caller(Slot, _ReturnAddress());
+    return g_trace_original[Slot](user, state);
+}
+
+GetState_t trace_detour(int slot) {
+    static const GetState_t detours[kTraceSlots] = {&trace_get_state<0>, &trace_get_state<1>, &trace_get_state<2>, &trace_get_state<3>,
+                                                    &trace_get_state<4>, &trace_get_state<5>, &trace_get_state<6>, &trace_get_state<7>};
+    return detours[slot];
+}
+
+// Watcher thread: hook XInput DLLs as they appear; also note the other controller APIs a game can use.
+void trace_pass() {
+    for (int d = 0; d < 4; ++d) {
+        HMODULE m = GetModuleHandleA(kTraceDlls[d]);
+        if (!m) continue;
+        for (int k = 0; k < 2; ++k) {
+            const int slot = d * 2 + k;
+            if (g_trace_hooked[slot]) continue;
+            g_trace_hooked[slot] = true;
+            void* target = reinterpret_cast<void*>(GetProcAddress(m, k ? MAKEINTRESOURCEA(100) : "XInputGetState"));
+            if (!target) continue;
+            const bool ok = hooks::hook_function(target, reinterpret_cast<void*>(trace_detour(slot)),
+                                                 reinterpret_cast<void**>(&g_trace_original[slot]));
+            log("xinput trace: %s!%s %s", kTraceDlls[d], k ? "XInputGetStateEx" : "XInputGetState", ok ? "hooked" : "could not be hooked");
+        }
+    }
+    static bool seen[3] = {};
+    const char* apis[] = {"Windows.Gaming.Input.dll", "GameInput.dll", "dinput8.dll"};
+    for (int i = 0; i < 3; ++i)
+        if (!seen[i] && GetModuleHandleA(apis[i])) {
+            seen[i] = true;
+            log("xinput trace: %s is loaded in the game", apis[i]);
+        }
 }
 
 void watch() {
@@ -254,6 +361,8 @@ void watch() {
         }
         g_real_mask = mask;
         if (g_settings.mode == Auto) scan_modules();
+        if (g_settings.trace) trace_pass();
+        hooks::verify();  // an overlay may rewrite the game's XInput imports after GyroUE patched them (Mortal Shell: EOS)
         g_watch_ready = true;
         Sleep(1000);
     }
@@ -350,8 +459,23 @@ XINPUT_GAMEPAD read_pad(SDL_Gamepad* pad, bool suppress_right_stick) {
     return g;
 }
 
+std::wstring widen(const std::string& text) {
+    std::wstring out(text.size(), L' ');
+    out.resize(size_t(MultiByteToWideChar(CP_UTF8, 0, text.data(), int(text.size()), out.data(), int(out.size()))));
+    return out;
+}
+
+void stop_rumble(SDL_Gamepad* pad) {
+    if (g_rumble_sent && pad) SDL_RumbleGamepad(pad, 0, 0, 0);
+    g_rumble_sent = 0;
+}
+
+}  // namespace
+
 // UE only checks empty XInput slots again after WM_DEVICECHANGE (XInputInterface's bNeedsControllerStateUpdate), so
 // tell its windows (on this, the game thread) when our controller appears or goes.
+bool sony_library() { return g_native[Sony]; }
+
 void announce_device_change() {
     int posted = 0;
     EnumThreadWindows(
@@ -366,19 +490,6 @@ void announce_device_change() {
         reinterpret_cast<LPARAM>(&posted));
     log("xinput: WM_DEVICECHANGE posted to %d game window(s)", posted);
 }
-
-std::wstring widen(const std::string& text) {
-    std::wstring out(text.size(), L' ');
-    out.resize(size_t(MultiByteToWideChar(CP_UTF8, 0, text.data(), int(text.size()), out.data(), int(out.size()))));
-    return out;
-}
-
-void stop_rumble(SDL_Gamepad* pad) {
-    if (g_rumble_sent && pad) SDL_RumbleGamepad(pad, 0, 0, 0);
-    g_rumble_sent = 0;
-}
-
-}  // namespace
 
 void install(const Settings& settings) {
     g_settings = settings;
@@ -410,6 +521,7 @@ void install(const Settings& settings) {
     // Auto watches how the game reads controllers; XInput=2 keeps it from reading them itself (HID devices, also
     // through Sony's pad library DLL: nativepad.cpp; and Raw Input for game controllers).
     hooks::add(nullptr, "RegisterRawInputDevices", reinterpret_cast<void*>(&hk_register_raw), reinterpret_cast<void**>(&g_register_raw));
+    hooks::add(nullptr, "GetRawInputData", reinterpret_cast<void*>(&hk_get_raw_data), reinterpret_cast<void**>(&g_get_raw_data));
     nativepad::refuse_pads(g_settings.mode == Always);
     if (g_settings.mode == Always)
         log("xinput: XInput=2: the game's own access to PlayStation/Nintendo controllers is refused; it only gets the Xbox controller");
@@ -447,14 +559,21 @@ bool frame(gl_context* ctx, gl_sdl* reader, const gl_output& out) {
         reason = "waiting for the first XInput check";
     } else if (g_real_mask) {  // also with XInput=2: the same pad through a remapper would act twice
         reason = "a real XInput controller is connected (Xbox pad, Steam Input or a remapper such as DS4Windows/DSX)";
-    } else if (g_settings.mode == Auto && g_native) {
-        reason = native_reason();
+    } else if (g_settings.mode == Auto && g_native[Any]) {
+        reason = native_reason(Any);
+    } else if (g_settings.mode == Auto && g_native[Sony] && SDL_GetGamepadVendor(pad) == 0x054C &&
+               !nativepad::dualsense_ignored()) {
+        // A PlayStation controller; other controllers are translated, and so is a DualSense the game's Sony library
+        // closed unread (it only knows the DualShock 4: from the next start the DualSense is shown to it as one).
+        reason = native_reason(Sony);
     } else if (!free_slots) {
         reason = "no free XInput slot";
-    } else if (g_settings.mode == Auto) {
+    } else if (g_settings.mode == Auto && !g_native[Sony]) {
+        // The game opening the controller's HID device: not with a Sony library, whose enumeration opens every HID
+        // device (Mortal Shell opens keyboards and lighting controllers for reading too).
         if (const uint16_t vendor = SDL_GetGamepadVendor(pad); nativepad::opened_vendor(vendor)) {
             native_sign("it opens the controller's HID device itself (vendor " + std::to_string(vendor) + ")");
-            reason = native_reason();
+            reason = native_reason(Any);
         }
     }
     if (reason.empty() && now - g_seen_since < kGraceMs) reason = "waiting for the game to start reading controllers";

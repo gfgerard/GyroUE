@@ -110,7 +110,11 @@ GyroUE can **show your controller to the game as an Xbox controller**: buttons, 
 
 - It's automatic (`XInput=1` in `GyroUE\GyroUE.ini`). GyroUE only does it when the game doesn't read the controller
   by itself and no Xbox controller is present, so games with native DualSense support, Steam Input, DS4Windows/DSX and
-  real Xbox pads are left alone.
+  real Xbox pads are left alone. In games that only support PlayStation controllers natively, other controllers
+  (Switch Pro, DirectInput pads) are still shown as Xbox ones.
+- A game whose own PlayStation support only knows the DualShock 4 (e.g. Mortal Shell) ignores a DualSense. GyroUE
+  notices it, shows the DualSense as an Xbox controller for that session and tells you on screen to restart: from then
+  on the game sees it as a DualShock 4 (PlayStation prompts, rumble, light bar). This is saved in the game's profile.
 - About 2 seconds after the game starts, a notice says *"Controller shown to the game as an Xbox controller"*.
 - The game shows Xbox button icons.
 - Settings in `GyroUE\GyroUE.ini` (a game's profile can override them; restart the game after a change):
@@ -142,6 +146,7 @@ doesn't follow the gyro, GyroUE tells you on screen, and [Advanced](docs/ADVANCE
 | Gears of War: E-Day (Game Pass) | ⚠️ Campaign only, **with EasyAntiCheat disabled** | Install in `Binaries\WinGDK`. The gyro starts a few seconds after the main menu appears. Never play online with it. |
 | The Outer Worlds: Spacer's Choice Edition | ✅ Works | |
 | Hogwarts Legacy | ✅ Works | |
+| Mortal Shell | ✅ Works | **No `F10` panel** (DX11): change settings in `gyrolib.ini`. The game's own PlayStation support only knows the DualShock 4: its profile makes GyroUE show your DualSense (USB or Bluetooth) to it as one, with PlayStation icons, rumble and light bar. |
 
 
 
