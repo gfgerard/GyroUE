@@ -1348,12 +1348,40 @@ or gyro to stick.
     Xbox/Game Pass build. Not an engine setting; dropped (a CommonUI `SetGamepadInputType` route was discussed, not
     pursued).
 
+- 2026-10-14 **Valor Mortis crashes in the main menu (2 sessions, not resolved).** The game reports crashes through Sentry
+  (crashpad), not UE's CrashReportClient: envelopes in `%LOCALAPPDATA%\ValorMortisMSG\.sentry-native\external\` hold
+  the minidump (attachment `event.minidump`) and are deleted once sent, so copy them before restarting the game.
+  - Dump (UE 5.7.3, GyroUE 0.8.2): access violation reading 0xFFFFFFFFFFFFFFFF at `exe+0x2EED0C0` on `RenderThread 0`;
+    that thread's stack has only the game, nvwgf2umx and D3D12Core, no GyroUE/GyroLib. DLSS frame generation on
+    (`ActiveFrameGen=1`, `DLSSFGMode=17`), RTSS hooks loaded, GyroUE's DX12 panel hooks active (render worker idle).
+  - Both crashes came less than 0.5 s after `gyro off: mouse cursor shown` in the main menu, both with
+    NativeFlickStick=1 (in the second, native suppression had just worked: 888 reports changed). Not isolated: the
+    proposed A/B (GyroUE without panel hooks via empty `ui.menu_key` and `ui.gamepad_menu_shortcut=0`; without GyroUE;
+    without frame generation) was declined for now.
+
 - 2026-10-14 **Build: GyroUE 0.8.2** (version chosen by the user), `build/release/GyroUE-v0.8.2.zip`. Since 0.8.1:
   UE 4.22-and-older name table (GNames/TNameEntryArray); UE 5.7 object array items (Object pointer at +8);
   `Property=Struct.Member` resolved by reflection and nested rotators tested live by the probe (camera manager
   candidates are outputs only inside the engine's part); the probe sets `Probe=0` by itself after a verified camera
   and its notice asks to restart; Jedi: Fallen Order profile (`Object=Camera`, `Property=ModeOutputs.Rotation`).
   Tested in game: Jedi: Fallen Order (probe + gyro, DualSense BT), Valor Mortis (UE 5.7, probe + gyro, DualSense).
+
+- 2026-10-14 **Bug (user): GyroLib's panel (F10 or the pad shortcut) navigated with the pad's d-pad also drove the
+  game behind it.** Only the controller shown as XInput was neutral while the panel was open (`xinput.cpp`,
+  `gl_panel_open`). Valor Mortis and Jedi: Fallen Order read the DualSense themselves (Sony's library, HID reports
+  through `nativepad.cpp`), which passed through untouched; a real XInput pad (Xbox, Steam Input, DS4Windows) did too.
+  - Fix: `host.cpp` `panel_has_pad`: true while the panel is open and, after it closes, until every SDL button is
+    released and both triggers are up (the close press doesn't reach the game). Passed per frame to
+    `xinput::set_neutral` (our slot reads neutral; real slots read connected with a zeroed `Gamepad`) and
+    `nativepad::set_neutral`: every Sony report the game reads with a known layout and a verified CRC is made idle
+    (`idle_report`: sticks 0x80, triggers 0, buttons cleared with the d-pad hat at 8, touch points "no finger"; motion,
+    sequence/counter and battery kept; Bluetooth CRC rewritten). DualSense layout for USB 0x01 and BT 0x31, DualShock 4
+    layout for DS4 0x01/0x11, a DualSense's basic BT 0x01 and a DualSense shown as a DualShock 4. Doesn't need
+    `NativeFlickStick` (DualSense handles are always followed; a real DualShock 4 only with `NativeFlickStick=1`).
+    Log: `nativepad: the game's controller reports made idle (GyroLib's panel has the controller)` / `passed through
+    again`. Not covered: games reading pads through Raw Input/DirectInput, and the press that opens the panel with the
+    pad shortcut (it reaches the game before GyroLib opens the panel).
+  - Built (no version bump), not tested in game yet.
 
 ## Dead ends
 

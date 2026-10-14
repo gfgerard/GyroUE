@@ -4,6 +4,7 @@
 // GetOverlappedResult). Used for:
 // - XInput=2: refusing those opens, so the game only gets the Xbox controller (xinput.cpp);
 // - auto mode: knowing which controllers the game opens itself (xinput.cpp);
+// - GyroLib's settings panel: while the pad drives it, the game reads an idle controller;
 // - GyroLib's flick stick with the game's native controller support: while GyroLib asks to suppress the native right
 //   stick, the right stick in the reports the game reads is centred (the controller itself, and GyroLib's own SDL
 //   reading, are untouched). Offered only once the report layout was checked against SDL's view of the stick.
@@ -28,6 +29,10 @@ bool dualsense_ignored();
 
 // XInput=2: refuse the game's opens of Sony/Nintendo HID devices and of the selected controller.
 void refuse_pads(bool refuse);
+
+// Game thread, once per frame: while GyroLib's panel has the controller, every report of a Sony controller the game
+// reads (known layout, CRC checked) reads as an idle controller: no buttons, centred sticks, triggers up.
+void set_neutral(bool neutral);
 
 // Vendor or product ID (key "vid" / "pid") in a HID device path, USB or Bluetooth form; 0 if absent.
 uint16_t hid_path_id(const wchar_t* path, const wchar_t* key);

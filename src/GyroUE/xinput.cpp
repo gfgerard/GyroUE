@@ -72,6 +72,7 @@ DWORD g_slot = 0;
 XINPUT_STATE g_state{};      // last state built on the game thread (neutral while the GyroLib panel is open); includes
                              // the Guide bit, which only XInputGetStateEx reports
 std::atomic<bool> g_enabled{true};            // XInputEnable(FALSE) from the game: neutral state, no rumble
+std::atomic<bool> g_neutral{false};           // GyroLib's panel has the controller: every slot reads idle
 std::atomic<uint32_t> g_rumble{0};            // last XInputSetState for our slot: left (low) << 16 | right (high)
 std::atomic<bool> g_game_polls{false};        // the game called XInputGetState at least once
 
@@ -112,18 +113,26 @@ bool our_state(DWORD user, XINPUT_STATE* state, bool guide) {
     return true;
 }
 
+// A real XInput controller (Xbox pad, Steam Input, a remapper) also reads idle while GyroLib's panel has the
+// controller: GyroLib may be reading that same pad through SDL. Still connected, so the game doesn't pause.
+DWORD idle_while_panel(DWORD result, XINPUT_STATE* state) {
+    if (result == ERROR_SUCCESS && state && g_neutral.load(std::memory_order_relaxed))
+        std::memset(&state->Gamepad, 0, sizeof(state->Gamepad));
+    return result;
+}
+
 DWORD WINAPI hk_get_state(DWORD user, XINPUT_STATE* state) {
     if (!g_game_polls.exchange(true)) log("xinput: the game polls XInputGetState");
     if (our_state(user, state, false)) return ERROR_SUCCESS;
     GetState_t real = original(g_get_state, "XInputGetState", "xinput1_4.dll");
-    return real ? real(user, state) : ERROR_DEVICE_NOT_CONNECTED;
+    return idle_while_panel(real ? real(user, state) : ERROR_DEVICE_NOT_CONNECTED, state);
 }
 
 DWORD WINAPI hk_get_state_ex(DWORD user, XINPUT_STATE* state) {
     if (!g_game_polls.exchange(true)) log("xinput: the game polls XInputGetStateEx");
     if (our_state(user, state, true)) return ERROR_SUCCESS;
     GetState_t real = original(g_get_state_ex, "XInputGetStateEx", "xinput1_4.dll", 100);
-    return real ? real(user, state) : ERROR_DEVICE_NOT_CONNECTED;
+    return idle_while_panel(real ? real(user, state) : ERROR_DEVICE_NOT_CONNECTED, state);
 }
 
 DWORD WINAPI hk_set_state(DWORD user, XINPUT_VIBRATION* vibration) {
@@ -533,6 +542,8 @@ void install(const Settings& settings) {
 
 SDL_Gamepad* selected_gamepad(gl_context* ctx, gl_sdl* reader, const gl_output& out) { return find_pad(ctx, reader, out); }
 
+void set_neutral(bool neutral) { g_neutral = neutral; }
+
 bool frame(gl_context* ctx, gl_sdl* reader, const gl_output& out) {
     if (g_settings.mode == Off) return false;
     if (!g_watch_started) {
@@ -579,9 +590,9 @@ bool frame(gl_context* ctx, gl_sdl* reader, const gl_output& out) {
     if (reason.empty() && now - g_seen_since < kGraceMs) reason = "waiting for the game to start reading controllers";
     const bool show = reason.empty();
 
-    // State for the game: neutral while GyroLib's panel is open (the pad drives the panel then).
+    // State for the game: neutral while GyroLib's panel has the controller (set_neutral).
     XINPUT_GAMEPAD g{};
-    if (show && !gl_panel_open(ctx)) g = read_pad(pad, out.suppress_native_right_stick != 0);
+    if (show && !g_neutral) g = read_pad(pad, out.suppress_native_right_stick != 0);
 
     bool was_shown = false;
     DWORD slot = 0;

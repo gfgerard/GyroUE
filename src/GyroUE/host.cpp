@@ -1256,6 +1256,19 @@ void engine_check() {
                  L"so the gyro can't turn the camera. Please report it with GyroUE\\GyroUE.log.", 20);
 }
 
+// GyroLib's panel is driven with the controller while it is open, so the game reads an idle controller then (XInput
+// and its own PlayStation support), and after the panel closes until every button is released and the triggers are
+// up: the press that closed it doesn't reach the game either.
+bool panel_has_pad(gl_context* ctx, SDL_Gamepad* pad) {
+    static bool held = false;
+    if (gl_panel_open(ctx)) return held = true;
+    if (!held || !pad) return held = false;
+    bool busy = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 8000 ||
+                SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8000;
+    for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT && !busy; ++b) busy = SDL_GetGamepadButton(pad, SDL_GamepadButton(b));
+    return held = busy;
+}
+
 void frame() {
     if (!g_gyro && !start_gyro()) {
         g_failed = true;
@@ -1304,6 +1317,9 @@ void frame() {
     // GyroLib's flick stick needs the game's own right-stick rotation suppressed: possible for the controller shown to
     // the game as XInput, or when the game reads the controller itself through a checked report layout.
     SDL_Gamepad* pad = xinput::selected_gamepad(g_gyro->get(), g_input->get(), out);
+    const bool neutral = panel_has_pad(g_gyro->get(), pad);
+    xinput::set_neutral(neutral);
+    nativepad::set_neutral(neutral);
     const bool xinput_shown = xinput::frame(g_gyro->get(), g_input->get(), out);
     const bool native = nativepad::frame(pad, out.suppress_native_right_stick != 0 && !xinput_shown);
     learn_dualsense();

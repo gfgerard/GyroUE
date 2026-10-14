@@ -32,6 +32,10 @@ void install(const Settings& settings);
 // Game thread: the SDL gamepad of GyroLib's selected controller (GyroLib owns it), or null. Cached; any mode.
 SDL_Gamepad* selected_gamepad(gl_context* ctx, gl_sdl* reader, const gl_output& out);
 
+// Game thread, once per frame before frame(): while GyroLib's panel has the controller, the game reads an idle
+// controller in every XInput slot (ours and real ones).
+void set_neutral(bool neutral);
+
 // Game thread, once per frame after the SDL reader was polled and gl_update ran (out is that update's output).
 // Updates the state the game reads and applies its rumble. Returns true while the pad is shown to the game.
 bool frame(gl_context* ctx, gl_sdl* reader, const gl_output& out);

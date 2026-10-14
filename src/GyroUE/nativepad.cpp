@@ -166,7 +166,9 @@ std::atomic<int> g_pending_count{0};
 std::mutex g_mutex;  // guards g_devices slot changes and g_pending
 
 std::atomic<bool> g_suppress{false};  // centre the selected controller's right stick in the reports (set per frame)
+std::atomic<bool> g_neutral{false};   // GyroLib's panel has the controller: every Sony report reads as idle (set per frame)
 std::atomic<uint32_t> g_changed{0};   // reports changed so far (diagnostics)
+std::atomic<uint32_t> g_neutralised{0};  // reports made idle so far (diagnostics)
 
 int find_device(HANDLE h) {
     for (int i = 0; i < kMaxDevices; ++i)
@@ -295,9 +297,42 @@ uint32_t stored_crc(const uint8_t* r, int at) {
     return uint32_t(r[at]) | uint32_t(r[at + 1]) << 8 | uint32_t(r[at + 2]) << 16 | uint32_t(r[at + 3]) << 24;
 }
 
+// The report as an idle controller sends it: sticks centred, no buttons (d-pad released), triggers up, no finger on
+// the touchpad; motion, sequence/counter and battery bytes are kept. Offsets from b = the left stick's X byte:
+//   DualSense (USB 0x01, Bluetooth 0x31): triggers b+4..5, buttons b+7..10 (d-pad in the low nibble of b+7, 8 =
+//     released), touch points at b+32 and b+36 (bit 7 set = no finger)
+//   DualShock 4 (USB 0x01, Bluetooth 0x11, a DualSense's basic Bluetooth 0x01, a DualSense shown as a DualShock 4):
+//     buttons b+4..5 and the low two bits of b+6 (the counter above them), triggers b+7..8, three touch packets from
+//     b+33 (9 bytes each: timestamp, then two 4-byte points)
+void idle_report(const Device& d, uint8_t* r, DWORD length, const Layout& layout) {
+    const int b = layout.stick - 2;
+    const auto set = [&](int i, uint8_t v) { if (DWORD(i) < length) r[i] = v; };
+    const auto no_finger = [&](int i) { if (DWORD(i) < length) r[i] |= 0x80; };
+    for (int k = 0; k < 4; ++k) set(b + k, 0x80);
+    if (is_dualsense(d.vendor, d.product) && !d.ds4 && (r[0] == 0x31 || !d.bluetooth)) {
+        set(b + 4, 0);
+        set(b + 5, 0);
+        set(b + 7, 0x08);
+        for (int k = 8; k <= 10; ++k) set(b + k, 0);
+        no_finger(b + 32);
+        no_finger(b + 36);
+    } else {
+        set(b + 4, 0x08);
+        set(b + 5, 0);
+        if (DWORD(b + 6) < length) r[b + 6] &= 0xFC;
+        set(b + 7, 0);
+        set(b + 8, 0);
+        for (int k = 0; k < 3; ++k) {
+            no_finger(b + 34 + 9 * k);
+            no_finger(b + 38 + 9 * k);
+        }
+    }
+}
+
 // One input report (length bytes at r) of controller d: returns the right stick before any change (x | y << 8), or
-// -1 if the layout is unknown or the CRC doesn't verify (left alone). Centres the stick when change is set.
-int32_t handle_report(Device& d, uint8_t* r, DWORD length, bool change) {
+// -1 if the layout is unknown or the CRC doesn't verify (left alone). Centres the stick when change is set; makes the
+// whole report idle when neutral is set.
+int32_t handle_report(Device& d, uint8_t* r, DWORD length, bool change, bool neutral) {
     const Layout layout = layout_of(r, length);
     if (!layout.stick) return -1;
     if (layout.crc && stored_crc(r, layout.crc) != report_crc(r, layout.crc)) {
@@ -306,13 +341,16 @@ int32_t handle_report(Device& d, uint8_t* r, DWORD length, bool change) {
         return -1;
     }
     const int32_t stick = int32_t(r[layout.stick]) | int32_t(r[layout.stick + 1]) << 8;
-    if (change) {
+    if (neutral) {
+        idle_report(d, r, length, layout);
+        ++g_neutralised;
+    } else if (change) {
         r[layout.stick] = r[layout.stick + 1] = 0x80;
-        if (layout.crc) {
-            const uint32_t crc = report_crc(r, layout.crc);
-            for (int k = 0; k < 4; ++k) r[layout.crc + k] = uint8_t(crc >> (8 * k));
-        }
         ++g_changed;
+    }
+    if ((neutral || change) && layout.crc) {
+        const uint32_t crc = report_crc(r, layout.crc);
+        for (int k = 0; k < 4; ++k) r[layout.crc + k] = uint8_t(crc >> (8 * k));
     }
     return stick;
 }
@@ -387,9 +425,10 @@ void on_report(int i, uint8_t* r, DWORD n, const char* how, DWORD chunk = 0) {
             if (r[at] == 0x01) dualsense_to_ds4(d, r + at);
     const bool change =
         g_suppress.load(std::memory_order_relaxed) && (uint32_t(d.vendor) << 16 | d.product) == g_pad_ids.load();
+    const bool neutral = g_neutral.load(std::memory_order_relaxed);
     int32_t newest = -1;
     for (DWORD at = 0; at + length <= n; at += length)
-        if (const int32_t stick = handle_report(d, r + at, length, change); stick >= 0) newest = stick;
+        if (const int32_t stick = handle_report(d, r + at, length, change, neutral); stick >= 0) newest = stick;
     if (newest < 0) return;
     d.stick = newest;
     d.last_report = GetTickCount64();
@@ -875,6 +914,12 @@ void install(bool suppression, bool dualsense_as_ds4) {
 }
 
 void refuse_pads(bool refuse) { g_refuse = refuse; }
+
+void set_neutral(bool neutral) {
+    if (g_neutral.exchange(neutral) == neutral || !g_device_count.load()) return;
+    log("nativepad: the game's controller reports %s (%u made idle so far)",
+        neutral ? "made idle (GyroLib's panel has the controller)" : "passed through again", g_neutralised.load());
+}
 
 uint16_t hid_path_id(const wchar_t* path, const wchar_t* key) { return path ? path_id(path, key) : 0; }
 
