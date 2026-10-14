@@ -1328,6 +1328,33 @@ or gyro to stick.
     by hand if the write failed). Texts that asked to set Probe=0 by hand updated (probe log header, GyroUE.ini
     default comment, profile header, ADVANCED.md).
 
+- 2026-10-14 **Valor Mortis (Xbox/Game Pass GDK build, UE 5.7, exe `ValorMortisMSG-Win64-Shipping.exe`), GyroUE 0.8.1:
+  engine not readable.** FNamePool found (exe+0xADF4ED0) but no GUObjectArray: data sections, XOR-encoded globals
+  (none) and three heap scans (7.4 GB) found nothing; one candidate at exe+0xAEC2F90 whose header matched but whose
+  items read null. The exe can't be read from disk (WindowsApps permissions).
+  - **Read-only look at the running game:** the candidate is the real `ObjObjects` (Max 0x210000, Num 70868, MaxChunks
+    0x21, NumChunks 2). Chunk pointers end in `...0008` and **each 0x18-byte `FUObjectItem` holds the Object pointer at
+    +0x8** (item i at chunk + i*0x18 + 8: objects with InternalIndex 0, 1, 2... and vtables in the exe). UE 5.7 puts a
+    64-bit field (flags and refcount merged) before the Object pointer.
+  - Fix (`ue.cpp`): `object_array_stride` also tries the Object pointer at +8 (`g_item_object`, used by
+    `object_at`); the log line says `object at +0x8`. Built (no version bump), not tested in game yet.
+  - **Tested (user, DualSense, Probe=1): works.** `GUObjectArray ... object at +0x8, 7135 objects`; reflection layout
+    unchanged (FField, SuperStruct=0x40 ChildProperties=0x50 Field.Next=0x18 Field.Name=0x20 Offset_Internal=0x44).
+    PC `BP_PlayerController_C`, pawn `BP_PlayerCharacter_C` (first person; menu pawn `BP_MenuPawn_C`). The probe
+    verified **`PC.ControlRotation`** (also turns the character), i.e. the generic view: the game needs no profile, only
+    the 5.7 fix. Probe=0 written by itself; the gyro worked without a restart because the verified view was already the
+    active one (the restart notice is misleading in that case). The written profile equals the default view.
+  - PlayStation prompts: PCGamingWiki's "Controller platform" setting is the game's own option, absent from the
+    Xbox/Game Pass build. Not an engine setting; dropped (a CommonUI `SetGamepadInputType` route was discussed, not
+    pursued).
+
+- 2026-10-14 **Build: GyroUE 0.8.2** (version chosen by the user), `build/release/GyroUE-v0.8.2.zip`. Since 0.8.1:
+  UE 4.22-and-older name table (GNames/TNameEntryArray); UE 5.7 object array items (Object pointer at +8);
+  `Property=Struct.Member` resolved by reflection and nested rotators tested live by the probe (camera manager
+  candidates are outputs only inside the engine's part); the probe sets `Probe=0` by itself after a verified camera
+  and its notice asks to restart; Jedi: Fallen Order profile (`Object=Camera`, `Property=ModeOutputs.Rotation`).
+  Tested in game: Jedi: Fallen Order (probe + gyro, DualSense BT), Valor Mortis (UE 5.7, probe + gyro, DualSense).
+
 ## Dead ends
 
 (none yet)

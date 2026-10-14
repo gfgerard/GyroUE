@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(GyroUE VERSION 0.8.1 LANGUAGES C CXX)  # the one place the GyroUE version lives (DLL log line + release zip name)
+project(GyroUE VERSION 0.8.2 LANGUAGES C CXX)  # the one place the GyroUE version lives (DLL log line + release zip name)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")  # static CRT: one less DLL to ship
 

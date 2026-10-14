@@ -127,6 +127,7 @@ constexpr uint32_t RF_ClassDefaultObject = 0x10, RF_ArchetypeObject = 0x20;
 
 uintptr_t g_obj_array = 0;   // TUObjectArray: Objects**, PreAllocated*, Max, Num, MaxChunks, NumChunks
 int g_item_stride = 0;       // sizeof(FUObjectItem)
+int g_item_object = 0;       // FUObjectItem::Object: +0, or +8 in UE 5.7 (a 64-bit flags/refcount field first)
 uintptr_t g_name_blocks = 0; // FNamePool Blocks[]
 bool g_header_len_high = true;  // FNameEntryHeader: Len in bits 6..15 (true) or 0..9
 // UE <= 4.22 has no FNamePool: TNameEntryArray (GNames) holds Chunks[128] of FNameEntry*[16384], then NumElements,
@@ -232,13 +233,15 @@ Obj object_at(int32_t i) {
     if (!chunks) return 0;
     const uintptr_t chunk = rdp(chunks + (i / 65536) * 8ull);
     if (!chunk) return 0;
-    return rdp(chunk + uintptr_t(i % 65536) * g_item_stride);
+    return rdp(chunk + uintptr_t(i % 65536) * g_item_stride + g_item_object);
 }
 
 // FChunkedFixedUObjectArray at a: Objects**, PreAllocatedObjects*, MaxElements, NumElements, MaxChunks,
 // NumChunks, with items 1..16 of chunk 0 being live UObjects whose InternalIndex matches. Returns the item
 // stride (sizeof(FUObjectItem)), 0 if the header doesn't match, -1 if the header matches but the items don't.
-int object_array_stride(uintptr_t a, uintptr_t* chunk0_out = nullptr) {
+// object_out: where the Object pointer is in an item (+0; +8 in UE 5.7, e.g. Valor Mortis, whose item starts with
+// a 64-bit flags/refcount field).
+int object_array_stride(uintptr_t a, uintptr_t* chunk0_out = nullptr, int* object_out = nullptr) {
     int32_t max = 0, num = 0, max_chunks = 0, num_chunks = 0;
     if (!rd(a + 0x10, max) || !rd(a + 0x14, num) || !rd(a + 0x18, max_chunks) || !rd(a + 0x1C, num_chunks)) return 0;
     if (num <= 1000 || num > max || max < 0x10000 || max > 0x10000000) return 0;
@@ -248,15 +251,20 @@ int object_array_stride(uintptr_t a, uintptr_t* chunk0_out = nullptr) {
     const uintptr_t chunk0 = chunks ? rdp(chunks) : 0;
     if (chunk0_out) *chunk0_out = chunk0;
     if (!chunk0) return -1;
-    for (int stride : {0x18, 0x10, 0x20, 0x28, 0x30}) {
-        bool ok = true;
-        for (int i = 1; i <= 16 && ok; ++i) {
-            const uintptr_t o = rdp(chunk0 + uintptr_t(i) * stride);
-            int32_t idx = -1;
-            uintptr_t vtable = 0;
-            ok = o && rd(o + kObjIndex, idx) && idx == i && rd(o, vtable) && in_module(vtable);
+    for (int object : {0, 8}) {
+        for (int stride : {0x18, 0x10, 0x20, 0x28, 0x30}) {
+            if (object + 8 > stride) continue;
+            bool ok = true;
+            for (int i = 1; i <= 16 && ok; ++i) {
+                const uintptr_t o = rdp(chunk0 + uintptr_t(i) * stride + object);
+                int32_t idx = -1;
+                uintptr_t vtable = 0;
+                ok = o && rd(o + kObjIndex, idx) && idx == i && rd(o, vtable) && in_module(vtable);
+            }
+            if (!ok) continue;
+            if (object_out) *object_out = object;
+            return stride;
         }
-        if (ok) return stride;
     }
     return -1;
 }
@@ -267,10 +275,12 @@ bool find_object_array(const std::vector<Range>& sections, bool diagnose = false
     for (const Range& r : sections) {
         for (uintptr_t a = r.begin; a + 0x20 <= r.end; a += 8) {
             uintptr_t chunk0 = 0;
-            const int stride = object_array_stride(a, &chunk0);
+            int object = 0;
+            const int stride = object_array_stride(a, &chunk0, &object);
             if (stride > 0) {
                 g_obj_array = a;
                 g_item_stride = stride;
+                g_item_object = object;
                 return true;
             }
             if (stride == 0 || !diagnose || candidates >= 8) continue;
@@ -389,7 +399,7 @@ bool find_encoded_object_array() {
         for (uintptr_t off = 0; off + 0x20 <= 0xB8; off += 8) {
             if (object_array_stride(object_array + off) <= 0) continue;
             g_obj_array = object_array + off;
-            g_item_stride = object_array_stride(g_obj_array);
+            g_item_stride = object_array_stride(g_obj_array, nullptr, &g_item_object);
             log("ue: FUObjectArray %p decoded from %s ^ key (code at %s); ObjObjects at +0x%llX",
                 reinterpret_cast<void*>(object_array), module_offset(g_encoded[i].global).c_str(),
                 module_offset(g_encoded[i].code).c_str(), static_cast<unsigned long long>(off));
@@ -717,7 +727,7 @@ bool init() {
         // Otherwise look for it in the whole heap, in the background.
         if (!found && g_heap_array) {
             g_obj_array = g_heap_array;
-            g_item_stride = object_array_stride(g_obj_array);
+            g_item_stride = object_array_stride(g_obj_array, nullptr, &g_item_object);
             found = g_item_stride > 0;
             if (!found) g_obj_array = g_heap_array = 0;
         }
@@ -731,8 +741,8 @@ bool init() {
             if (!found && diagnose) log("ue: GUObjectArray not found yet (retrying every 10 s)");
         }
         if (found)
-            log("ue: GUObjectArray.ObjObjects at %s (item stride 0x%X, %d objects)", module_offset(g_obj_array).c_str(),
-                g_item_stride, object_count());
+            log("ue: GUObjectArray.ObjObjects at %s (item stride 0x%X, object at +0x%X, %d objects)",
+                module_offset(g_obj_array).c_str(), g_item_stride, g_item_object, object_count());
     }
     if (!g_name_blocks && find_name_pool(sections))
         log("ue: FNamePool.Blocks at %s (header len %s)", module_offset(g_name_blocks).c_str(),
