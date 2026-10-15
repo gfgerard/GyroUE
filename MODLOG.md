@@ -1408,11 +1408,6 @@ or gyro to stick.
   - Capability: `xinput_shown || real XInput filter || native buttons verified`; log `long-press blocking available
     (...)` / `unavailable: ...`. Not covered: Raw Input/DirectInput games, Steam Input keyboard bindings.
 
-- 2026-10-15 **Build: GyroUE 0.9.0** (version chosen by the user), `build/release/GyroUE-v0.9.0.zip`. Since 0.8.2:
-  GyroLib's long-press blocking (`longpress.cpp`; virtual XInput, real XInput and the game's own Sony controller
-  reports, capability declared only where it works); the game reads an idle controller while GyroLib's panel has the
-  pad (and until the closing press is released). Not tested in game yet (Cronos has the build before the version bump).
-
 - 2026-10-15 **Camera recenter wired for the generic view (user's request; built, no version bump, not tested in game
   yet).** GyroLib 1.3.1 (`ADVANCED_MOTION.md`, "Recenter camera"): `gl_set_recenter_step_callback` exposes
   `context.N.camera.recenter_button` (default 0 = Off, the player binds it in the panel) and
@@ -1461,6 +1456,13 @@ or gyro to stick.
   - Buttons read from GyroLib's selected SDL pad after `gl_update` (triggers > 8000), applied on the next frame.
     Latest activated profile wins. Toggle turns off when gameplay is interrupted (not the default view, cursor,
     pause, no focus, panel has the pad), because the game's own aim state isn't read. Log: `profile: <label>`.
+
+- 2026-10-15 **Build: GyroUE 0.9.0** (version chosen by the user), `build/release/GyroUE-v0.9.0.zip`, rebuilt with
+  everything since 0.8.2 (an earlier 0.9.0 zip with only long-press blocking was never tagged): GyroLib long-press
+  blocking (virtual XInput, real XInput and the game's own Sony controller reports); camera recenter button in every
+  view (`RecenterPitch=`, `Recenter=0`); sensitivity profiles ADS / ALT_ADS / OTHER (`<Key>ProfileButton=` and
+  `<Key>ProfileMode=` in GyroUE.ini, all off by default, "- disabled" tabs with a description); default view
+  labelled "Exploration". Tested in game: not yet (Cronos has this build, ADS on LT Hold).
 
 ## Dead ends
 
