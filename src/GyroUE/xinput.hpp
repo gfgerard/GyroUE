@@ -3,6 +3,8 @@
 // Xbox (XInput) controller: the game's own imports of XInputGetState/SetState/GetCapabilities/Enable are redirected
 // (import-table hooks on game modules only, so SDL's own XInput use never sees it). For games that only support
 // XInput and run without Steam Input (e.g. Epic). Off when the game already reads the pad itself (see xinput.cpp).
+#include <cstdint>
+
 struct gl_context;
 struct gl_sdl;
 struct gl_output;
@@ -35,6 +37,11 @@ SDL_Gamepad* selected_gamepad(gl_context* ctx, gl_sdl* reader, const gl_output& 
 // Game thread, once per frame before frame(): while GyroLib's panel has the controller, the game reads an idle
 // controller in every XInput slot (ours and real ones).
 void set_neutral(bool neutral);
+
+// Game thread, once per frame before frame(): long-press blocking's button mask (longpress.cpp, SDL button bits) for
+// the controller shown as XInput and, when the selected pad is itself a real XInput controller the game polls (Xbox
+// pad, Steam Input), for real XInput slots. Returns true in that second case (the filter works there).
+bool set_buttons(SDL_Gamepad* pad, uint32_t hide, uint32_t tap);
 
 // Game thread, once per frame after the SDL reader was polled and gl_update ran (out is that update's output).
 // Updates the state the game reads and applies its rumble. Returns true while the pad is shown to the game.

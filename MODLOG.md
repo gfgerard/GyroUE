@@ -1383,6 +1383,70 @@ or gyro to stick.
     pad shortcut (it reaches the game before GyroLib opens the panel).
   - Built (no version bump), not tested in game yet.
 
+- 2026-10-15 **GyroLib long-press blocking wired (user's request; built, no version bump, not tested in game yet).**
+  GyroLib 1.3.1 (`ADVANCED_MOTION.md`, "Blocking long-press actions"): with `context.N.gyro.activation` Hold (3) or
+  Hold to disable (5), a single `context.N.activation.button` (1..32 = SDL button ordinal + 1) and
+  `context.N.activation.block_long_press=1`, `gl_filter_event` defers that button's press: release < 200 ms ->
+  `GL_EMIT_TAP` (the host gives the game a short press), hold >= 200 ms -> the game action is blocked. Needs
+  `GL_HOST_LONG_PRESS_BLOCKING`, declared only after the events are wired.
+  - `longpress.cpp` (new, game thread, after `gl_update`): press/repeat/release of every SDL button of the selected
+    pad through `gl_filter_event` (eligible = the active view's activation button), as the SDK's
+    `examples/tps/controller_actions.hpp`. Result per button: `hide` (deferred or blocked; the activation button is
+    held back from its very first report while blocking is on, because the game reads the pad on its own threads and a
+    press seen for one report would already be its action) and `tap` (80 ms press after `GL_EMIT_TAP`). Focus loss,
+    the panel taking the pad (`panel_has_pad`) or a controller change finish held buttons with `native_hold=1` and drop
+    pending taps. `host.suspend_long_press_blocking` stays 0: GyroUE can't see the game's own hold interactions.
+  - Applied in three places: `xinput.cpp` `read_pad` (our slot; buttons by SDL ordinal before the A/B swap of
+    `XInputNintendoLabels`); real XInput slots in `XInputGetState(Ex)` when the selected pad is itself an XInput pad
+    the game polls (Xbox type or Steam Input handle; packet number offset by a change counter so a tap reads as new
+    input); `nativepad.cpp` reports of the selected Sony controller (button bytes from b+7 DualSense / b+4 DualShock 4:
+    hat + face, L1 R1 L2 R2 Create Options L3 R3, PS touchpad Mute (DualSense only); hat re-encoded; BT CRC rewritten).
+  - Native reports are changed only after their button bytes agree with SDL (face, shoulders, Create/Options, L3/R3,
+    d-pad; >= 10 compared reads with a button down and >= 4x the misses; 30+ misses dominating -> never). Sony
+    controllers the game reads are now always followed (was: DualSense always, DualShock 4 only with
+    `NativeFlickStick=1`).
+  - Capability: `xinput_shown || real XInput filter || native buttons verified`; log `long-press blocking available
+    (...)` / `unavailable: ...`. Not covered: Raw Input/DirectInput games, Steam Input keyboard bindings.
+
+- 2026-10-15 **Build: GyroUE 0.9.0** (version chosen by the user), `build/release/GyroUE-v0.9.0.zip`. Since 0.8.2:
+  GyroLib's long-press blocking (`longpress.cpp`; virtual XInput, real XInput and the game's own Sony controller
+  reports, capability declared only where it works); the game reads an idle controller while GyroLib's panel has the
+  pad (and until the closing press is released). Not tested in game yet (Cronos has the build before the version bump).
+
+- 2026-10-15 **Camera recenter wired for the generic view (user's request; built, no version bump, not tested in game
+  yet).** GyroLib 1.3.1 (`ADVANCED_MOTION.md`, "Recenter camera"): `gl_set_recenter_step_callback` exposes
+  `context.N.camera.recenter_button` (default 0 = Off, the player binds it in the panel) and
+  `context.N.camera.recenter_duration_ms` (0..1000, default 0 = instant). The callback gets the fraction of the
+  remaining pitch to remove (`pitch += (level - pitch) * fraction`); GyroLib already drops requests unfocused, paused,
+  on a cursor view or in menus, and does not hide the button from the game.
+  - `host.cpp`: the callback is registered only while the active view is the generic default view (id 1, no
+    `Property=`/`Object=`/`Offsets=`, i.e. `PlayerController.ControlRotation`); a profile view withdraws it (NULL,
+    which hides the panel row and cancels a running transition). No gameplay view keeps the current state.
+  - The callback runs inside `gl_update`; fractions are combined (`1 - (1 - a)(1 - b)`) and applied after the gyro
+    delta: read `ControlRotation` pitch (UE stores 0..360), `wrap180`, add `-pitch * fraction` with `add_rotator`.
+    Not counted as gyro motion by the follow check. Log: `recenter: available (...)` / `unavailable in this view`.
+  - To test: bind a button in the Recenter row, look up/down, press it (instant and with a duration); check a game
+    whose PlayerCameraManager clamps pitch (writes may land at 360 instead of 0) and that profile views hide the row.
+  - Deployed to Pacific Drive (0.9.0 DLL, generic on-foot view + car view) for the test.
+
+- 2026-10-15 **Camera recenter extended to every view (user's request: best effort for custom cameras, it's an
+  optional feature; built, no version bump, not tested in game yet).** Replaces the generic-only rule above.
+  - Supported while the active view's rotation can be read (`read_view_pitch`: the first raw offset with
+    `RotatorSize`, else `Property=`/`ControlRotation` with its own element size). Decided when the view changes and
+    retried while unreadable; a transient read failure never withdraws it (that would cancel a transition).
+  - Applied through `apply(view, s, delta, 0)` with `delta = wrap180(RecenterPitch - pitch) * fraction`, so every
+    raw offset (Cronos' two rotators), `WorldRotation=1` and the `OnGyro=` writes get it like a gyro delta.
+  - New per-view profile keys: `RecenterPitch=` (level in the view's rotator, degrees, default 0) and `Recenter=0`
+    (withdraw it: hides the panel row). Log: `recenter: available in view N 'Label' (level pitch X)` /
+    `unavailable in view N 'Label' (Recenter=0 in the profile | its rotation can't be read yet)`.
+  - Unverified per profile: Pacific Drive car (`CameraControllerRotation_Target`, relative to the car), Cronos (raw
+    View component rotators), Jedi (`ModeOutputs.Rotation`), Hogwarts (`BehaviorStack` float rotators, may be an
+    accumulator), Life is Strange (axes split across rotators; pitch is read from the first offset, +0x33CC, which is
+    the pitch one).
+  - Fix (user, Pacific Drive): the Recenter row was missing in the panel opened from the main menu, because the
+    callback was only registered once a gameplay view appeared (`view: none` in menus). It is now registered in
+    `start_gyro`; a gameplay view with `Recenter=0` or an unreadable rotation still withdraws it.
+
 ## Dead ends
 
 (none yet)

@@ -139,6 +139,7 @@ struct Device {
     DWORD report_length = 0;                // the device's input report length (HidP_GetCaps), 0 = unknown
     std::atomic<ULONGLONG> last_report{0};  // tick of the last report with a known layout
     std::atomic<int32_t> stick{-1};         // right stick in that report before any change: x | y << 8
+    std::atomic<int32_t> buttons{-1};       // its buttons before any change (SDL button bits), -1 = unknown
     std::atomic<bool> logged{false};        // first report logged
     std::atomic<bool> crc_warned{false};
     bool ds4 = false;                       // a DualSense shown to the game as a (USB) DualShock 4
@@ -169,6 +170,11 @@ std::atomic<bool> g_suppress{false};  // centre the selected controller's right 
 std::atomic<bool> g_neutral{false};   // GyroLib's panel has the controller: every Sony report reads as idle (set per frame)
 std::atomic<uint32_t> g_changed{0};   // reports changed so far (diagnostics)
 std::atomic<uint32_t> g_neutralised{0};  // reports made idle so far (diagnostics)
+// Long-press blocking (longpress.cpp): the selected controller's buttons held back or added (SDL button bits), once its
+// button layout was checked against SDL (g_buttons_ok).
+std::atomic<uint32_t> g_hide{0}, g_tap{0};
+std::atomic<bool> g_buttons_ok{false};
+std::atomic<uint32_t> g_buttons_changed{0};  // reports whose buttons changed so far (diagnostics)
 
 int find_device(HANDLE h) {
     for (int i = 0; i < kMaxDevices; ++i)
@@ -209,6 +215,7 @@ void track(HANDLE h, uint16_t vendor, uint16_t product, bool ds4, bool bluetooth
         d.report_length = length;
         d.last_report = 0;
         d.stick = -1;
+        d.buttons = -1;
         d.logged = false;
         d.crc_warned = false;
         d.ds4 = ds4;
@@ -304,12 +311,17 @@ uint32_t stored_crc(const uint8_t* r, int at) {
 //   DualShock 4 (USB 0x01, Bluetooth 0x11, a DualSense's basic Bluetooth 0x01, a DualSense shown as a DualShock 4):
 //     buttons b+4..5 and the low two bits of b+6 (the counter above them), triggers b+7..8, three touch packets from
 //     b+33 (9 bytes each: timestamp, then two 4-byte points)
+// The report uses the DualSense's own layout (else the DualShock 4's, see idle_report).
+bool dualsense_layout(const Device& d, const uint8_t* r) {
+    return is_dualsense(d.vendor, d.product) && !d.ds4 && (r[0] == 0x31 || !d.bluetooth);
+}
+
 void idle_report(const Device& d, uint8_t* r, DWORD length, const Layout& layout) {
     const int b = layout.stick - 2;
     const auto set = [&](int i, uint8_t v) { if (DWORD(i) < length) r[i] = v; };
     const auto no_finger = [&](int i) { if (DWORD(i) < length) r[i] |= 0x80; };
     for (int k = 0; k < 4; ++k) set(b + k, 0x80);
-    if (is_dualsense(d.vendor, d.product) && !d.ds4 && (r[0] == 0x31 || !d.bluetooth)) {
+    if (dualsense_layout(d, r)) {
         set(b + 4, 0);
         set(b + 5, 0);
         set(b + 7, 0x08);
@@ -329,10 +341,76 @@ void idle_report(const Device& d, uint8_t* r, DWORD length, const Layout& layout
     }
 }
 
+// Buttons as SDL_GamepadButton bits. Both layouts share the bits of their three button bytes (DualSense from b+7,
+// DualShock 4 from b+4): d-pad hat in the low nibble of the first (0 up, clockwise, 8 released) and the face buttons
+// above it; then L1 R1 L2 R2 Create/Share Options L3 R3; then PS, touchpad click and (DualSense only: on a DualShock 4
+// the rest of that byte is its report counter) Mute.
+struct ButtonBit {
+    SDL_GamepadButton button;
+    uint8_t byte, mask;
+};
+constexpr ButtonBit kButtonBits[] = {
+    {SDL_GAMEPAD_BUTTON_WEST, 0, 0x10},           {SDL_GAMEPAD_BUTTON_SOUTH, 0, 0x20},
+    {SDL_GAMEPAD_BUTTON_EAST, 0, 0x40},           {SDL_GAMEPAD_BUTTON_NORTH, 0, 0x80},
+    {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 1, 0x01},  {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 1, 0x02},
+    {SDL_GAMEPAD_BUTTON_BACK, 1, 0x10},           {SDL_GAMEPAD_BUTTON_START, 1, 0x20},
+    {SDL_GAMEPAD_BUTTON_LEFT_STICK, 1, 0x40},     {SDL_GAMEPAD_BUTTON_RIGHT_STICK, 1, 0x80},
+    {SDL_GAMEPAD_BUTTON_GUIDE, 2, 0x01},          {SDL_GAMEPAD_BUTTON_TOUCHPAD, 2, 0x02},
+    {SDL_GAMEPAD_BUTTON_MISC1, 2, 0x04}};
+constexpr uint32_t bit(SDL_GamepadButton b) { return 1u << b; }
+constexpr uint32_t kUp = bit(SDL_GAMEPAD_BUTTON_DPAD_UP), kDown = bit(SDL_GAMEPAD_BUTTON_DPAD_DOWN),
+                   kLeft = bit(SDL_GAMEPAD_BUTTON_DPAD_LEFT), kRight = bit(SDL_GAMEPAD_BUTTON_DPAD_RIGHT);
+constexpr uint32_t kHat[9] = {kUp, kUp | kRight, kRight, kDown | kRight, kDown, kDown | kLeft, kLeft, kUp | kLeft, 0};
+// Compared with SDL's view to trust the layout (not PS, touchpad or Mute: Windows or Steam may take those).
+constexpr uint32_t kCheckedButtons =
+    bit(SDL_GAMEPAD_BUTTON_SOUTH) | bit(SDL_GAMEPAD_BUTTON_EAST) | bit(SDL_GAMEPAD_BUTTON_WEST) |
+    bit(SDL_GAMEPAD_BUTTON_NORTH) | bit(SDL_GAMEPAD_BUTTON_BACK) | bit(SDL_GAMEPAD_BUTTON_START) |
+    bit(SDL_GAMEPAD_BUTTON_LEFT_STICK) | bit(SDL_GAMEPAD_BUTTON_RIGHT_STICK) | bit(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) |
+    bit(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) | kUp | kDown | kLeft | kRight;
+
+// Where the three button bytes start, or -1 if the report is too short.
+int button_bytes(const Device& d, const uint8_t* r, DWORD length, const Layout& layout) {
+    const int at = layout.stick - 2 + (dualsense_layout(d, r) ? 7 : 4);
+    return DWORD(at + 2) < length ? at : -1;
+}
+
+uint32_t report_buttons(const Device& d, const uint8_t* r, int at) {
+    const bool dualsense = dualsense_layout(d, r);
+    uint32_t bits = kHat[std::min(r[at] & 0x0F, 8)];
+    for (const ButtonBit& b : kButtonBits)
+        if ((dualsense || b.button != SDL_GAMEPAD_BUTTON_MISC1) && (r[at + b.byte] & b.mask)) bits |= bit(b.button);
+    return bits;
+}
+
+// Writes buttons (SDL bits) into the report; a d-pad pair that can't be one hat value (up and down) keeps up/right.
+void write_buttons(const Device& d, uint8_t* r, int at, uint32_t bits) {
+    const bool dualsense = dualsense_layout(d, r);
+    for (const ButtonBit& b : kButtonBits) {
+        if (!dualsense && b.button == SDL_GAMEPAD_BUTTON_MISC1) continue;
+        if (bits & bit(b.button)) r[at + b.byte] |= b.mask;
+        else r[at + b.byte] &= uint8_t(~b.mask);
+    }
+    uint32_t pad = bits & (kUp | kDown | kLeft | kRight);
+    if ((pad & kUp) && (pad & kDown)) pad &= ~kDown;
+    if ((pad & kLeft) && (pad & kRight)) pad &= ~kLeft;
+    uint8_t hat = 8;
+    for (uint8_t k = 0; k < 9; ++k)
+        if (kHat[k] == pad) hat = k;
+    r[at] = uint8_t((r[at] & 0xF0) | hat);
+}
+
+// What to change in the reports of one read.
+struct Edit {
+    bool centre_stick = false;  // flick stick: the game doesn't see the right stick
+    bool idle = false;          // GyroLib's panel has the controller: the whole report reads idle
+    uint32_t hide = 0, tap = 0;  // long-press blocking (SDL button bits)
+};
+
 // One input report (length bytes at r) of controller d: returns the right stick before any change (x | y << 8), or
-// -1 if the layout is unknown or the CRC doesn't verify (left alone). Centres the stick when change is set; makes the
-// whole report idle when neutral is set.
-int32_t handle_report(Device& d, uint8_t* r, DWORD length, bool change, bool neutral) {
+// -1 if the layout is unknown or the CRC doesn't verify (left alone); buttons gets its buttons before any change (SDL
+// bits, -1 if unknown). Applies edit.
+int32_t handle_report(Device& d, uint8_t* r, DWORD length, const Edit& edit, int32_t& buttons) {
+    buttons = -1;
     const Layout layout = layout_of(r, length);
     if (!layout.stick) return -1;
     if (layout.crc && stored_crc(r, layout.crc) != report_crc(r, layout.crc)) {
@@ -341,14 +419,30 @@ int32_t handle_report(Device& d, uint8_t* r, DWORD length, bool change, bool neu
         return -1;
     }
     const int32_t stick = int32_t(r[layout.stick]) | int32_t(r[layout.stick + 1]) << 8;
-    if (neutral) {
+    const int at = button_bytes(d, r, length, layout);
+    const uint32_t before = at >= 0 ? report_buttons(d, r, at) : 0;
+    if (at >= 0) buttons = int32_t(before);
+    bool changed = false;
+    if (edit.idle) {
         idle_report(d, r, length, layout);
         ++g_neutralised;
-    } else if (change) {
-        r[layout.stick] = r[layout.stick + 1] = 0x80;
-        ++g_changed;
+        changed = true;
+    } else {
+        if (edit.centre_stick) {
+            r[layout.stick] = r[layout.stick + 1] = 0x80;
+            ++g_changed;
+            changed = true;
+        }
+        if (at >= 0 && (edit.hide | edit.tap)) {
+            const uint32_t after = (before & ~edit.hide) | edit.tap;
+            if (after != before) {
+                write_buttons(d, r, at, after);
+                ++g_buttons_changed;
+                changed = true;
+            }
+        }
     }
-    if ((neutral || change) && layout.crc) {
+    if (changed && layout.crc) {
         const uint32_t crc = report_crc(r, layout.crc);
         for (int k = 0; k < 4; ++k) r[layout.crc + k] = uint8_t(crc >> (8 * k));
     }
@@ -423,14 +517,25 @@ void on_report(int i, uint8_t* r, DWORD n, const char* how, DWORD chunk = 0) {
     if (d.ds4 && !d.bluetooth)
         for (DWORD at = 0; at + 64 <= n && length == 64; at += 64)
             if (r[at] == 0x01) dualsense_to_ds4(d, r + at);
-    const bool change =
-        g_suppress.load(std::memory_order_relaxed) && (uint32_t(d.vendor) << 16 | d.product) == g_pad_ids.load();
-    const bool neutral = g_neutral.load(std::memory_order_relaxed);
-    int32_t newest = -1;
-    for (DWORD at = 0; at + length <= n; at += length)
-        if (const int32_t stick = handle_report(d, r + at, length, change, neutral); stick >= 0) newest = stick;
+    const bool selected = (uint32_t(d.vendor) << 16 | d.product) == g_pad_ids.load();
+    Edit edit;
+    edit.centre_stick = selected && g_suppress.load(std::memory_order_relaxed);
+    edit.idle = g_neutral.load(std::memory_order_relaxed);
+    if (selected && g_buttons_ok.load(std::memory_order_relaxed)) {
+        edit.hide = g_hide.load(std::memory_order_relaxed);
+        edit.tap = g_tap.load(std::memory_order_relaxed);
+    }
+    int32_t newest = -1, newest_buttons = -1;
+    for (DWORD at = 0; at + length <= n; at += length) {
+        int32_t buttons = -1;
+        if (const int32_t stick = handle_report(d, r + at, length, edit, buttons); stick >= 0) {
+            newest = stick;
+            newest_buttons = buttons;
+        }
+    }
     if (newest < 0) return;
     d.stick = newest;
+    d.buttons = newest_buttons;
     d.last_report = GetTickCount64();
 }
 
@@ -493,7 +598,9 @@ HANDLE WINAPI hk_create_file(LPCWSTR path, DWORD access, DWORD share, LPSECURITY
         ULONGLONG expected = 0;
         g_dualsense_opened.compare_exchange_strong(expected, GetTickCount64());
     }
-    if (hid && vendor && (dualsense || (g_suppression && reads))) {  // every HID device read is logged; only Sony reports change
+    // Every HID device read is logged with NativeFlickStick; Sony controllers read by the game are always followed (the
+    // panel's idle controller and long-press blocking need them); only Sony reports change.
+    if (hid && vendor && (dualsense || (reads && (g_suppression || vendor == kSony)))) {
         const DWORD error = GetLastError();
         track(h, vendor, product, ds4, bluetooth);
         SetLastError(error);
@@ -939,6 +1046,55 @@ bool opened_vendor(uint16_t vendor) {
     return false;
 }
 
+namespace {
+
+// Long-press blocking changes the selected controller's buttons in the game's reports once its button bytes agree
+// with SDL's view of the buttons: >= 10 compared reads with a button down (and >= 4x the misses); 30+ misses
+// dominating -> never for that controller. buttons = the newest report's buttons (-1 = none fresh).
+void check_buttons(SDL_Gamepad* pad, uint32_t ids, int32_t buttons, bool reading) {
+    static uint32_t checked = 0;
+    static int matches = 0, misses = 0;
+    static bool verified = false, mismatch = false;
+    if (ids != checked) {
+        checked = ids;
+        matches = misses = 0;
+        verified = mismatch = false;
+    }
+    if (pad && buttons >= 0 && !verified && !mismatch) {
+        uint32_t sdl = 0;
+        for (int n = 0; n < 32 && n < int(SDL_GAMEPAD_BUTTON_COUNT); ++n)
+            if (SDL_GetGamepadButton(pad, SDL_GamepadButton(n))) sdl |= 1u << n;
+        sdl &= kCheckedButtons;
+        const uint32_t report = uint32_t(buttons) & kCheckedButtons;
+        if (sdl | report) {
+            if (sdl == report) ++matches;
+            else ++misses;
+            if (matches >= 10 && matches >= 4 * misses) {
+                verified = true;
+                log("nativepad: %04X:%04X: the buttons in the game's reports match SDL (%d of %d samples)", ids >> 16,
+                    ids & 0xFFFF, matches, matches + misses);
+            } else if (misses >= 30 && misses > matches) {
+                mismatch = true;
+                log("nativepad: %04X:%04X: the buttons in the game's reports don't match SDL (report %08X, SDL %08X; "
+                    "%d of %d samples off): no long-press blocking for it",
+                    ids >> 16, ids & 0xFFFF, report, sdl, misses, matches + misses);
+            }
+        }
+    }
+    const bool ok = reading && verified;
+    if (g_buttons_ok.exchange(ok) != ok)
+        log(ok ? "nativepad: long-press blocking available (buttons in the game's own controller reports)"
+               : "nativepad: long-press blocking unavailable: the game stopped reading the controller");
+}
+
+}  // namespace
+
+bool set_buttons(uint32_t hide, uint32_t tap) {
+    g_hide = hide;
+    g_tap = tap;
+    return g_buttons_ok;
+}
+
 bool frame(SDL_Gamepad* pad, bool suppress) {
     const uint32_t ids = pad ? uint32_t(SDL_GetGamepadVendor(pad)) << 16 | SDL_GetGamepadProduct(pad) : 0;
     g_pad_ids = ids;
@@ -955,20 +1111,23 @@ bool frame(SDL_Gamepad* pad, bool suppress) {
         matches = misses = 0;
         verified = mismatch = false;
     }
-    bool reading = false;
-    if (g_suppression && ids) {
-        const ULONGLONG now = GetTickCount64();
-        ULONGLONG last = 0;
-        int32_t stick = -1;
+    // The newest report of the selected controller the game read.
+    const ULONGLONG now = GetTickCount64();
+    ULONGLONG last = 0;
+    int32_t stick = -1, buttons = -1;
+    if (ids)
         for (Device& d : g_devices) {
             if (!d.handle.load(std::memory_order_acquire) || (uint32_t(d.vendor) << 16 | d.product) != ids) continue;
             const ULONGLONG t = d.last_report;
             if (t > last) {
                 last = t;
                 stick = d.stick;
+                buttons = d.buttons;
             }
         }
-        reading = last && now - last < 2000;
+    const bool reading = last && now - last < 2000;
+    check_buttons(pad, ids, reading && now - last < 100 ? buttons : -1, reading);
+    if (g_suppression && ids) {
         if (reading && !verified && !mismatch && stick >= 0 && now - last < 100) {
             const int sx = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX), sy = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY);
             if (std::abs(sx) > 12000 || std::abs(sy) > 12000) {

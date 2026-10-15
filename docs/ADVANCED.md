@@ -25,8 +25,13 @@ play.
   trigger, invert axes, smoothing and more, saved to `gyrolib.ini`. Edits to `gyrolib.ini` are also reloaded
   live while the game runs. GyroUE declares `GL_HOST_MENU_STATE` to GyroLib, plus native right-stick
   suppression while it translates the controller to XInput or while the game reads a PlayStation controller itself
-  through a checked report layout (`NativeFlickStick`): no touchpad suppression, no long-press blocking and
-  no recenter callback (see [Current scope](../README.md#current-scope)).
+  through a checked report layout (`NativeFlickStick`): no touchpad suppression and no long-press blocking
+  (see [Current scope](../README.md#current-scope)). The recenter step callback
+  (`gl_set_recenter_step_callback`) is registered from the start (so the main menu's panel shows it) and kept while the active view's rotation can be read (any view: the
+  generic `ControlRotation` or a profile's `Property=`/`Offsets=`), and withdrawn in a view with `Recenter=0` or
+  whose rotation can't be read. It moves the pitch to the view's `RecenterPitch=` (default 0) through the same
+  writes as the gyro (all offsets, `WorldRotation`, `OnGyro=`). Custom cameras are best effort: their level may
+  not be 0. The log says `recenter: available in view N` / `unavailable in view N (...)`.
 - **Coexists with ReShade, RenoDX (HDR) and the Steam overlay.** Panel rendering runs on GyroUE's own
   thread, so it keeps working when the engine moves `Present`/`ResizeBuffers` between threads.
 - **Diagnostics for new games:** a status line every 10 s in `GyroUE.log`, plus an optional probe (`F7`
@@ -46,7 +51,7 @@ play.
 | Mortal Shell | UE 4.25+, DX11 | yes (shipped) | Generic camera path. The game links an old Sony pad library (`WinDualShock`) that knows only the DualShock 4: the profile sets `DualSenseAsDualShock4=1` (PlayStation icons, rumble, light bar). Other controllers (Switch Pro, DirectInput) are shown as Xbox ones; the Epic Online Services overlay rewrites the game's XInput import after GyroUE, which takes it back. Tested with a DualSense over USB and Bluetooth (buttons, sticks, rumble, light bar, native flick stick). No settings panel (DX11). |
 | Hogwarts Legacy | UE 4 | yes | Third person detached camera, new objects detected. Native DualSense (delay-loaded `libScePad.dll`): XInput translation stays off. |
 | Visage | UE 4  | no | First person camera XInput translation/Steam input needed. |
-
+| Valor Mortis | UE 5.7 | no |  |
 
 Tested with a DualSense over USB/BT and Nintendo Switch Pro Controller. Requirements and limits:
 
@@ -84,6 +89,8 @@ All diagnostics go to `GyroUE\GyroUE.log` (probe results, if enabled, to `GyroUE
 | `dualsense: the game's own PlayStation support closed the DualSense unread ...` | The game's Sony library only knows the DualShock 4. `DualSenseAsDualShock4=1` was written to its profile (`GyroUE\profiles\<exe>.ini`, created if needed); the DualSense is an Xbox controller until the game restarts. |
 | `nativepad: DualSense 054C:0CE6 (version ...) shown to the game as a DualShock 4` | `DualSenseAsDualShock4=1` in the game's profile: the game asked who the controller is and got a DualShock 4. Then `feature report 0x.. asked by the game: answered with ...` lists what it checked, and `output report 0x05 -> DualSense report 0x02/0x31` its rumble and light bar. `opened ... Bluetooth, shown to it as a USB DualShock 4` and `Bluetooth, ... reads, converted` for a Bluetooth DualSense. If the game opens the controller and closes it for good right after the identity line, it rejected the emulation: report it with the log. |
 | `nativepad: the game's controller reports made idle (GyroLib's panel has the controller)` | While the settings panel is open (and until you release the button that closed it), the game reads an idle controller, so navigating the panel doesn't also move you in the game. `passed through again` when that ends. The controller shown as XInput, and real XInput controllers, read idle too. |
+| `long-press blocking available (...)` | GyroLib's *Block long press* works for your controller: with Hold or Hold to disable on a single button, a short press of that button still does its game action (when you release it), a hold only controls the gyro. For a controller the game reads itself, it becomes available after `nativepad: ... the buttons in the game's reports match SDL`, i.e. after you've pressed a few buttons in game. `unavailable` when the game reads the controller in a way GyroUE can't change (Raw Input, DirectInput). |
+| `longpress: button N tapped` / `held` | Long-press blocking at work (first few logged): `tapped` = a short press passed to the game, `held` = a hold whose game action was blocked. N is SDL's button number (0 south/Cross, 1 east/Circle, 2 west/Square, 3 north/Triangle...). |
 | `nativepad: right stick centred in the game's reports` | Flick stick is active: the game sees a centred right stick (`passed through` when it stops, e.g. in menus). |
 | `xinput: XInput=2: the game's access to HID device 054C:0CE6 refused` | With `XInput=2` the game tried to open the controller itself (its own DualSense support) and was refused, so it only gets the Xbox controller. `Raw Input registration ... dropped` is the same for Raw Input. |
 | `hooks: the import of ... was written back by something else (now <module>)` | Another module (an overlay such as Epic Online Services' `EOSOVH-Win64-Shipping.dll`) rewrote a game import GyroUE had patched. XInput imports are `patched again` so the translated controller keeps reaching the game; others are `left to it`. |
@@ -182,6 +189,9 @@ Label=Camera
 ;   RotatorSize=24       24 = double (UE5), 12 = float (UE4)
 ;   WorldRotation=1      with Property=RelativeRotation of a scene component that uses absolute rotation: also
 ;                        writes the component's world rotation (see "Components with absolute rotation")
+;   RecenterPitch=0      level pitch for the recenter button, in this view's rotator (degrees, default 0);
+;                        set it when "level" isn't 0 in a custom camera
+;   Recenter=0           hide the recenter button in this view (it doesn't level this camera properly)
 
 [View.InCar]
 Id=2

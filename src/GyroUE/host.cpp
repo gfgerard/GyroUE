@@ -2,6 +2,7 @@
 
 #include "deps.hpp"
 #include "log.hpp"
+#include "longpress.hpp"
 #include "nativepad.hpp"
 #include "notify.hpp"
 #include "overlay.hpp"
@@ -55,6 +56,10 @@ struct View {
         bool warned = false;
     };
     std::vector<OnGyro> on_gyro;
+    // Camera recenter (GyroLib's camera.recenter_button): Recenter=0 withdraws it in this view; RecenterPitch= is the
+    // level pitch in the view's own rotator (degrees, default 0).
+    bool recenter = true;
+    double recenter_pitch = 0;
     // Diagnostics: log these properties whenever they change; Dump=1 logs all properties once.
     std::vector<std::string> watch;
     bool dump = false, dumped = false;
@@ -82,6 +87,20 @@ uint32_t g_last_view = UINT32_MAX;
 double g_applied_yaw = 0, g_applied_pitch = 0;
 bool g_applied_this_frame = false;
 bool g_stick_suppression = false;  // GL_HOST_NATIVE_STICK_SUPPRESSION declared (xinput.cpp or nativepad.cpp can do it)
+bool g_long_press = false;         // GL_HOST_LONG_PRESS_BLOCKING declared (longpress.cpp, applied by xinput/nativepad)
+
+// Camera recenter (GyroLib's camera.recenter_button, Off until the player binds a button in the panel). Every view
+// whose rotation GyroUE can read supports it (level = the view's RecenterPitch, default 0); the callback is withdrawn
+// while a view with Recenter=0, or one whose rotation can't be read, is active, which also hides the setting in the
+// panel. GyroLib calls the step callback inside gl_update; the fractions are combined and applied after the gyro delta.
+// Custom cameras (raw offsets, relative rotators) are best effort: their level may not be 0, see RecenterPitch=.
+bool g_recenter_supported = false;
+uint32_t g_recenter_view = 0;  // view the support was last decided for
+double g_recenter_fraction = 0;  // fraction of the remaining pitch to remove this frame
+
+void GL_CALL on_recenter_step(void*, double fraction) {
+    g_recenter_fraction = 1 - (1 - g_recenter_fraction) * (1 - std::clamp(fraction, 0.0, 1.0));
+}
 
 // Motion delivery, for the status line. Samples and distinct arrival times come from GyroLib's sample observer; the
 // camera updates count how often the gyro turned the camera, and how often it did so without a new sample. The Switch
@@ -181,6 +200,8 @@ void load_view_extras(View& v, const wchar_t* section) {
     v.watch = split(ini(section, L"Watch"), ',');
     v.watched_values.assign(v.watch.size(), std::string{});
     v.dump = GetPrivateProfileIntW(section, L"Dump", 0, g_profile_path.c_str()) != 0;
+    v.recenter = GetPrivateProfileIntW(section, L"Recenter", 1, g_profile_path.c_str()) != 0;
+    v.recenter_pitch = std::atof(ini(section, L"RecenterPitch", L"0").c_str());
     for (const std::string& item : split(ini(section, L"OnGyro"), ',')) {
         const size_t colon = item.find(':');
         if (colon == std::string::npos) continue;
@@ -369,6 +390,11 @@ bool start_gyro() {
     g_gyro->initialize_settings(dir.c_str());
     log("gyro: settings %s (menu key F%u, gamepad shortcut %u)", gl_get_settings_path(ctx), gl_get_menu_key(ctx),
         gl_get_gamepad_menu_shortcut(ctx));
+
+    // Recenter is offered from the start, so the panel shows it in the main menu too; a gameplay view that can't
+    // support it withdraws it (update_recenter_support).
+    gl_set_recenter_step_callback(ctx, &on_recenter_step, nullptr);
+    g_recenter_supported = true;
 
     g_input.emplace(*g_gyro);
     gl_set_sample_observer(ctx, &on_sample, nullptr);  // delivery status (and the motion trace) need every sample
@@ -570,6 +596,46 @@ double wrap180(double a) {
     if (a > 180) a -= 360;
     if (a < -180) a += 360;
     return a;
+}
+
+// The pitch of the rotator the gyro turns in this view (the first one for raw offsets, which hold the same value).
+// For WorldRotation=1 views it is the absolute RelativeRotation, which equals the world rotation.
+bool read_view_pitch(const View& view, const Scene& s, double& pitch) {
+    const ue::Obj target = view_object(view, s);
+    if (!target) return false;
+    double yaw = 0, roll = 0;
+    if (!view.offsets.empty()) return ue::read_rotator(target + view.offsets.front(), view.rotator_size, pitch, yaw, roll);
+    const ue::Prop p = ue::prop_of(target, view.property.empty() ? "ControlRotation" : view.property.c_str());
+    return p && ue::read_rotator(target + p.offset, p.element_size, pitch, yaw, roll);
+}
+
+// Offers (or withdraws) the recenter button for the active view: decided when the view changes, and retried while the
+// view's rotation can't be read yet (no withdrawal on a transient read failure, which would cancel a transition).
+// It starts offered (start_gyro). No gameplay view keeps the current state: GyroLib discards requests in menus anyway,
+// and withdrawing there would hide the setting in the panel opened from a menu.
+void update_recenter_support(const View* view, const Scene& s) {
+    if (!view) return;
+    if (view->id == g_recenter_view && (g_recenter_supported || !view->recenter)) return;
+    double pitch = 0;
+    const bool supported = view->recenter && read_view_pitch(*view, s, pitch);
+    const bool changed = supported != g_recenter_supported || view->id != g_recenter_view;
+    g_recenter_view = view->id;
+    if (!changed) return;
+    if (supported != g_recenter_supported)
+        gl_set_recenter_step_callback(g_gyro->get(), supported ? &on_recenter_step : nullptr, nullptr);
+    g_recenter_supported = supported;
+    if (supported) log("recenter: available in view %u '%s' (level pitch %.1f)", view->id, view->label.c_str(), view->recenter_pitch);
+    else log("recenter: unavailable in view %u '%s' (%s)", view->id, view->label.c_str(),
+             view->recenter ? "its rotation can't be read yet" : "Recenter=0 in the profile");
+}
+
+// Removes `fraction` of the remaining pitch to the view's level, through the same writes as the gyro (all raw offsets,
+// WorldRotation, OnGyro). UE keeps pitch as 0..360 (350 = 10 degrees up), hence the wrap.
+bool apply_recenter(View& view, const Scene& s, double fraction) {
+    double pitch = 0;
+    if (!read_view_pitch(view, s, pitch)) return false;
+    const double delta = wrap180(view.recenter_pitch - pitch) * fraction;
+    return delta == 0 || apply(view, s, delta, 0);
 }
 
 void take_snapshot(const Scene& s) {
@@ -1313,6 +1379,8 @@ void frame() {
         }
     }
     const uint64_t now_ns = SDL_GetTicksNS();
+    update_recenter_support(view, s);
+    g_recenter_fraction = 0;
     const gl_output out = g_input->update(now_ns, host, view_id);
     // GyroLib's flick stick needs the game's own right-stick rotation suppressed: possible for the controller shown to
     // the game as XInput, or when the game reads the controller itself through a checked report layout.
@@ -1320,12 +1388,26 @@ void frame() {
     const bool neutral = panel_has_pad(g_gyro->get(), pad);
     xinput::set_neutral(neutral);
     nativepad::set_neutral(neutral);
+    // Long-press blocking: the activation button's press is held back from the game, or given to it as a short tap,
+    // wherever the game reads that controller through a path GyroUE can change.
+    const longpress::Mask buttons = longpress::frame(g_gyro->get(), pad, now_ns, host.focused && !neutral, g_long_press);
+    const bool real_buttons = xinput::set_buttons(pad, buttons.hide, buttons.tap);
+    const bool native_buttons = nativepad::set_buttons(buttons.hide, buttons.tap);
     const bool xinput_shown = xinput::frame(g_gyro->get(), g_input->get(), out);
     const bool native = nativepad::frame(pad, out.suppress_native_right_stick != 0 && !xinput_shown);
     learn_dualsense();
-    if ((xinput_shown || native) != g_stick_suppression) {
+    const bool long_press = xinput_shown || real_buttons || native_buttons;
+    if ((xinput_shown || native) != g_stick_suppression || long_press != g_long_press) {
         g_stick_suppression = xinput_shown || native;
-        gl_set_host_capabilities(g_gyro->get(), GL_HOST_MENU_STATE | (g_stick_suppression ? GL_HOST_NATIVE_STICK_SUPPRESSION : 0u));
+        if (long_press != g_long_press)
+            log("long-press blocking %s", long_press ? (xinput_shown ? "available (the controller shown as XInput)"
+                                                       : real_buttons ? "available (the real XInput controller)"
+                                                                      : "available (the game's own controller reports)")
+                                                     : "unavailable: the game reads the controller in a way GyroUE can't change");
+        g_long_press = long_press;
+        gl_set_host_capabilities(g_gyro->get(), GL_HOST_MENU_STATE |
+                                                    (g_stick_suppression ? GL_HOST_NATIVE_STICK_SUPPRESSION : 0u) |
+                                                    (g_long_press ? GL_HOST_LONG_PRESS_BLOCKING : 0u));
     }
 
     double gyro_deg = 0;  // gyro rotation actually written this frame
@@ -1344,6 +1426,12 @@ void frame() {
             g_applied_pitch += pitch;
             gyro_deg = std::abs(yaw) + std::abs(pitch);
         }
+    }
+    // Recenter after the gyro delta (GyroLib's order); it isn't gyro motion, so the follow check doesn't count it.
+    if (g_recenter_fraction > 0 && view && view->id == g_recenter_view && g_recenter_supported && host.camera_allowed &&
+        !probe_capturing()) {
+        if (apply_recenter(*view, s, g_recenter_fraction)) g_applied_this_frame = true;
+        else log("recenter: view %u rotation not written, request dropped", view->id);
     }
     follow_check(s, view, gyro_deg);
     if (g_probe) auto_probe(s);

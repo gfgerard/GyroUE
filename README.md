@@ -147,7 +147,8 @@ doesn't follow the gyro, GyroUE tells you on screen, and [Advanced](docs/ADVANCE
 | The Outer Worlds: Spacer's Choice Edition | ✅ Works |  |
 | Hogwarts Legacy | ✅ Works | Needs custom profile |
 | Mortal Shell | ✅ Works | **No `F10` panel** (DX11): change settings in `gyrolib.ini`. The game's own PlayStation support only knows the DualShock 4: its profile makes GyroUE show your DualSense (USB or Bluetooth) to it as one, with PlayStation icons, rumble and light bar. |
-
+| Visage | ✅ Works | **No `F10` panel** (DX11): change settings in `gyrolib.ini`. |
+| Valor Mortis | ✅ Works |  |
 
 
 ## Current scope
@@ -163,6 +164,6 @@ GyroUE doesn't implement them yet:
 | Separate settings per camera (e.g. on foot / in car) | ✅ | Needs a game profile (shipped for the supported games). |
 | Settings panel (`F10`) | ✅ DirectX 12 only | The panel needs rendering and window integration, which GyroUE has for DX12 only. DX11 games: edit `gyrolib.ini`. |
 | Flick stick | ✅ In Xinput mode (auto / **XInput=2** to force it), and (⚠️ experimental) in games with their own PlayStation controller support | Needs the game's own right-stick rotation suppressed. GyroUE can do that for the controller it translates to XInput ([see above](#controllers-the-game-doesnt-support)), and for a DualSense/DualShock 4 the game reads itself through Sony's pad library (`NativeFlickStick=1`, off by default, with `XInput=1`: the game keeps PlayStation icons, haptics and adaptive triggers; the flick options appear after you move the right stick once in game). Otherwise GyroLib's panel hides the flick options, and the `context.N.flick.*` keys in `gyrolib.ini` are just stored preferences, don't edit them by hand. |
-| Gyro button that doesn't also act in the game | ❌ | GyroUE doesn't filter the game's input (no long-press blocking). A button used to hold or toggle the gyro still does its normal action in the game: pick one the game doesn't need. |
-| Camera recenter button | ❌ | Needs the mod to recenter the game's camera on request (a host callback). |
+| Gyro button long press | ✅ | A button used to hold or toggle the gyro if pressed for more than 200ms. Do not use a button that has a long press action in-game. |
+| Camera recenter button | ✅ **Off by default**; ⚠️ best effort in games with a custom camera profile | Levels the camera's pitch (up/down) when you press the button you pick in the settings panel's **Recenter** row (`context.N.camera.recenter_button` in `gyrolib.ini`, one per camera); its **+** sets how long it takes (0 = instant). Reliable with the generic camera. With a game profile's custom camera (e.g. a car camera) it may stop a bit above or below level, or not work well: it's optional, just leave it Off there. The button still does its normal action in the game: pick one the game doesn't need. |
 | Different sensitivity when aiming down sights or scoped | ❌ | GyroUE doesn't detect aiming. Camera settings only change between profile views (e.g. a vehicle). |

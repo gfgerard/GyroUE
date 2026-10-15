@@ -73,6 +73,9 @@ XINPUT_STATE g_state{};      // last state built on the game thread (neutral whi
                              // the Guide bit, which only XInputGetStateEx reports
 std::atomic<bool> g_enabled{true};            // XInputEnable(FALSE) from the game: neutral state, no rumble
 std::atomic<bool> g_neutral{false};           // GyroLib's panel has the controller: every slot reads idle
+std::atomic<uint32_t> g_hide{0}, g_tap{0};    // long-press blocking (longpress.cpp), SDL button bits, set per frame
+std::atomic<bool> g_real_filter{false};       // ... also applied to real XInput slots: the selected pad is one of them
+std::atomic<uint32_t> g_mask_changes{0};      // added to real packet numbers, so a changed button reads as new input
 std::atomic<uint32_t> g_rumble{0};            // last XInputSetState for our slot: left (low) << 16 | right (high)
 std::atomic<bool> g_game_polls{false};        // the game called XInputGetState at least once
 
@@ -113,11 +116,28 @@ bool our_state(DWORD user, XINPUT_STATE* state, bool guide) {
     return true;
 }
 
-// A real XInput controller (Xbox pad, Steam Input, a remapper) also reads idle while GyroLib's panel has the
-// controller: GyroLib may be reading that same pad through SDL. Still connected, so the game doesn't pause.
-DWORD idle_while_panel(DWORD result, XINPUT_STATE* state) {
-    if (result == ERROR_SUCCESS && state && g_neutral.load(std::memory_order_relaxed))
+// XInput buttons by SDL_GamepadButton ordinal (position, as SDL names an Xbox pad's buttons).
+constexpr WORD kXInputOf[] = {XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
+                              XINPUT_GAMEPAD_BACK, kGuide, XINPUT_GAMEPAD_START, XINPUT_GAMEPAD_LEFT_THUMB,
+                              XINPUT_GAMEPAD_RIGHT_THUMB, XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER,
+                              XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT,
+                              XINPUT_GAMEPAD_DPAD_RIGHT};
+
+// A real XInput controller (Xbox pad, Steam Input, a remapper) as the game reads it: idle while GyroLib's panel has
+// the controller (GyroLib may be reading that same pad through SDL; still connected, so the game doesn't pause), and
+// with long-press blocking applied while the selected controller is a real XInput one.
+DWORD real_state(DWORD result, XINPUT_STATE* state) {
+    if (result != ERROR_SUCCESS || !state) return result;
+    if (g_neutral.load(std::memory_order_relaxed)) {
         std::memset(&state->Gamepad, 0, sizeof(state->Gamepad));
+    } else if (g_real_filter.load(std::memory_order_relaxed)) {
+        const uint32_t hide = g_hide.load(std::memory_order_relaxed), tap = g_tap.load(std::memory_order_relaxed);
+        for (unsigned n = 0; n < std::size(kXInputOf); ++n) {
+            if (hide & (1u << n)) state->Gamepad.wButtons &= ~kXInputOf[n];
+            if (tap & (1u << n)) state->Gamepad.wButtons |= kXInputOf[n];
+        }
+        state->dwPacketNumber += g_mask_changes.load(std::memory_order_relaxed);
+    }
     return result;
 }
 
@@ -125,14 +145,14 @@ DWORD WINAPI hk_get_state(DWORD user, XINPUT_STATE* state) {
     if (!g_game_polls.exchange(true)) log("xinput: the game polls XInputGetState");
     if (our_state(user, state, false)) return ERROR_SUCCESS;
     GetState_t real = original(g_get_state, "XInputGetState", "xinput1_4.dll");
-    return idle_while_panel(real ? real(user, state) : ERROR_DEVICE_NOT_CONNECTED, state);
+    return real_state(real ? real(user, state) : ERROR_DEVICE_NOT_CONNECTED, state);
 }
 
 DWORD WINAPI hk_get_state_ex(DWORD user, XINPUT_STATE* state) {
     if (!g_game_polls.exchange(true)) log("xinput: the game polls XInputGetStateEx");
     if (our_state(user, state, true)) return ERROR_SUCCESS;
     GetState_t real = original(g_get_state_ex, "XInputGetStateEx", "xinput1_4.dll", 100);
-    return idle_while_panel(real ? real(user, state) : ERROR_DEVICE_NOT_CONNECTED, state);
+    return real_state(real ? real(user, state) : ERROR_DEVICE_NOT_CONNECTED, state);
 }
 
 DWORD WINAPI hk_set_state(DWORD user, XINPUT_VIBRATION* vibration) {
@@ -431,6 +451,12 @@ BYTE trigger(SDL_Gamepad* pad, SDL_GamepadAxis a) {
     return BYTE(std::min(255, (v * 255 + 16383) / 32767));
 }
 
+// A button as the game gets it: long-press blocking can hold a press back or add a short one (longpress.cpp).
+bool button(SDL_Gamepad* pad, SDL_GamepadButton b) {
+    const uint32_t bit = 1u << b;
+    return (SDL_GetGamepadButton(pad, b) && !(g_hide.load() & bit)) || (g_tap.load() & bit);
+}
+
 XINPUT_GAMEPAD read_pad(SDL_Gamepad* pad, bool suppress_right_stick) {
     XINPUT_GAMEPAD g{};
     auto set = [&](bool on, WORD bit) {
@@ -444,19 +470,19 @@ XINPUT_GAMEPAD read_pad(SDL_Gamepad* pad, bool suppress_right_stick) {
     const WORD by_position[] = {XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y};
     const WORD swapped[] = {XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_Y, XINPUT_GAMEPAD_X};
     for (int i = 0; i < 4; ++i)
-        set(SDL_GetGamepadButton(pad, face[i]), g_settings.nintendo_labels ? swapped[i] : by_position[i]);
-    set(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_BACK), XINPUT_GAMEPAD_BACK);
-    if (g_settings.touchpad_back) set(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_TOUCHPAD), XINPUT_GAMEPAD_BACK);
-    set(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_START), XINPUT_GAMEPAD_START);
-    set(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_GUIDE), kGuide);
-    set(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_LEFT_STICK), XINPUT_GAMEPAD_LEFT_THUMB);
-    set(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_STICK), XINPUT_GAMEPAD_RIGHT_THUMB);
-    set(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER), XINPUT_GAMEPAD_LEFT_SHOULDER);
-    set(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER), XINPUT_GAMEPAD_RIGHT_SHOULDER);
-    set(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_UP), XINPUT_GAMEPAD_DPAD_UP);
-    set(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_DOWN), XINPUT_GAMEPAD_DPAD_DOWN);
-    set(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_LEFT), XINPUT_GAMEPAD_DPAD_LEFT);
-    set(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT), XINPUT_GAMEPAD_DPAD_RIGHT);
+        set(button(pad, face[i]), g_settings.nintendo_labels ? swapped[i] : by_position[i]);
+    set(button(pad, SDL_GAMEPAD_BUTTON_BACK), XINPUT_GAMEPAD_BACK);
+    if (g_settings.touchpad_back) set(button(pad, SDL_GAMEPAD_BUTTON_TOUCHPAD), XINPUT_GAMEPAD_BACK);
+    set(button(pad, SDL_GAMEPAD_BUTTON_START), XINPUT_GAMEPAD_START);
+    set(button(pad, SDL_GAMEPAD_BUTTON_GUIDE), kGuide);
+    set(button(pad, SDL_GAMEPAD_BUTTON_LEFT_STICK), XINPUT_GAMEPAD_LEFT_THUMB);
+    set(button(pad, SDL_GAMEPAD_BUTTON_RIGHT_STICK), XINPUT_GAMEPAD_RIGHT_THUMB);
+    set(button(pad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER), XINPUT_GAMEPAD_LEFT_SHOULDER);
+    set(button(pad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER), XINPUT_GAMEPAD_RIGHT_SHOULDER);
+    set(button(pad, SDL_GAMEPAD_BUTTON_DPAD_UP), XINPUT_GAMEPAD_DPAD_UP);
+    set(button(pad, SDL_GAMEPAD_BUTTON_DPAD_DOWN), XINPUT_GAMEPAD_DPAD_DOWN);
+    set(button(pad, SDL_GAMEPAD_BUTTON_DPAD_LEFT), XINPUT_GAMEPAD_DPAD_LEFT);
+    set(button(pad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT), XINPUT_GAMEPAD_DPAD_RIGHT);
     g.bLeftTrigger = trigger(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
     g.bRightTrigger = trigger(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
     g.sThumbLX = axis(pad, SDL_GAMEPAD_AXIS_LEFTX, false);
@@ -543,6 +569,25 @@ void install(const Settings& settings) {
 SDL_Gamepad* selected_gamepad(gl_context* ctx, gl_sdl* reader, const gl_output& out) { return find_pad(ctx, reader, out); }
 
 void set_neutral(bool neutral) { g_neutral = neutral; }
+
+bool set_buttons(SDL_Gamepad* pad, uint32_t hide, uint32_t tap) {
+    if (g_hide.exchange(hide) != hide) ++g_mask_changes;
+    if (g_tap.exchange(tap) != tap) ++g_mask_changes;
+    // The selected pad is itself a real XInput controller (an Xbox pad, or Steam Input's virtual one) that the game
+    // polls: the same filter works on what XInputGetState returns.
+    bool real = false;
+    if (g_settings.mode != Off && pad && g_game_polls && g_real_mask) {
+        const SDL_GamepadType type = SDL_GetGamepadType(pad);
+        real = type == SDL_GAMEPAD_TYPE_XBOX360 || type == SDL_GAMEPAD_TYPE_XBOXONE || SDL_GetGamepadSteamHandle(pad);
+    }
+    {
+        std::lock_guard lock(g_mutex);
+        if (real && g_exposed) real = false;
+    }
+    if (g_real_filter.exchange(real) != real)
+        log("xinput: long-press blocking %s the real XInput controller", real ? "available for" : "no longer applied to");
+    return real;
+}
 
 bool frame(gl_context* ctx, gl_sdl* reader, const gl_output& out) {
     if (g_settings.mode == Off) return false;
