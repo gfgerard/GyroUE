@@ -174,9 +174,9 @@ doesn't follow the gyro, GyroUE tells you on screen, and [Advanced](docs/ADVANCE
 GyroUE does one thing: **turn the game's camera with the gyro**. GyroLib can do more, but some of its
 features only work if the mod also hooks the game in specific ways (hide the game's own stick input, filter
 its button actions, move its camera on request, draw the panel). GyroLib leaves those hooks to the mod, and
-GyroUE doesn't implement them yet:
+GyroUE may not implement them yet:
 
-| Feature | In GyroUE | Why |
+| Feature | In GyroUE | Details |
 |---|---|---|
 | Gyro camera with calibration, smoothing, curves and an activation button | ✅ | The core of the mod. |
 | Separate settings per camera (e.g. on foot / in car) | ✅ | Needs a game profile (shipped for the supported games). |
