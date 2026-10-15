@@ -90,6 +90,24 @@ changed.
   how the gyro activates (always on, hold a button or trigger, toggle), invert axes, smoothing, acceleration
   curves and more. Games with several cameras (e.g. on foot / in car) get one tab each. Settings are saved
   automatically. GyroLib features that need hooks GyroUE doesn't have yet: see [Current scope](#current-scope).
+- **Sensitivity profiles (ADS, ALT_ADS, OTHER).** Besides **Exploration** (the default, always on), the panel has
+  an **ADS**, an **ALT_ADS** (for games with a second aim, e.g. a scope) and an **OTHER** tab. They are **off until
+  you give them a button and a mode** in `GyroUE\GyroUE.ini`: until then their tab reads e.g. "ADS - disabled" and
+  its description says which keys to set. An enabled profile starts with the Exploration settings
+  (ALT_ADS with the ADS settings), so nothing changes until you edit its tab, and replaces them while its button is
+  held, or from one press to the next. A game's profile can override these settings; restart the game after a
+  change. They only apply to the main camera, not to other camera views such as a car.
+
+  | Profile setting | Meaning |
+  |---|---|
+  | `AdsProfileButton=` | Button for the ADS profile: `LT RT LB RB LS RS A B X Y` (or `L2 R2 L1 R1 L3 R3 Cross Circle Square Triangle`), `Back Start Up Down Left Right Touchpad Misc`, paddles `LP1 LP2 RP1 RP2`. Empty = disabled. |
+  | `AdsProfileMode=` | `Hold`: active while the button is held. `Toggle`: one press on, the next off; it also turns off on pause, menus and cutscenes, since GyroUE can't see whether the game is still aiming. Empty = disabled. |
+  | `AltAdsProfileButton=`, `AltAdsProfileMode=` | Same for the ALT_ADS profile. |
+  | `OtherProfileButton=`, `OtherProfileMode=` | Same for the OTHER profile. |
+
+  Example: `AdsProfileButton=LT` and `AdsProfileMode=Hold`.
+
+  When two profiles are active, the one activated last wins. The button still does its normal action in the game.
 - **First time: calibrate.** Leave the controller still on a table for a few seconds while in a menu or the pause
   screen. GyroUE learns the sensor drift by itself and keeps it. The panel also has a **"Recalibrate gyro"**
   button.

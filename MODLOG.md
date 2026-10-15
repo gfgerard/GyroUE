@@ -1446,6 +1446,21 @@ or gyro to stick.
   - Fix (user, Pacific Drive): the Recenter row was missing in the panel opened from the main menu, because the
     callback was only registered once a gameplay view appeared (`view: none` in menus). It is now registered in
     `start_gyro`; a gameplay view with `Recenter=0` or an unreadable rotation still withdraws it.
+- 2026-10-15 **Sensitivity profiles ADS / ALT_ADS / OTHER (user's request; built, no version bump, not tested in game yet).**
+  GyroLib's panel can't bind a button to a view (a tab edits a view, never activates it; no host-defined settings),
+  so the buttons live in `GyroUE.ini` (`[GyroUE]`, the game's profile overrides): `<Key>ProfileButton=` and
+  `<Key>ProfileMode=Hold|Toggle` for Key = Ads, AltAds, Other. All off by default (the default GyroUE.ini writes
+  them empty): a profile needs both keys valid. The default view's label is now "Exploration" (was "Camera").
+  - GyroLib views 1001 (ADS), 1002 (ALT_ADS, a second aim) and 1003 (OTHER), always registered. Disabled ones get
+    the label "<label> - disabled" and a tab description saying which keys to set. Parents: ADS and OTHER inherit
+    view 1; ALT_ADS inherits ADS. Profile views must not use these Ids (logged, profile off and no tab).
+  - No in-game notice for disabled profiles: GyroLib 1.3.1 has no API for the panel's selected tab (a notice on
+    opening was tried and dropped, user's call: the tab label and description already explain it).
+  - Only in the default view (id 1): `frame()` passes the profile's id to `g_input->update` instead of 1; the
+    rotation is still written through the default view. Vehicles and other views keep their own tab (LT = brake there).
+  - Buttons read from GyroLib's selected SDL pad after `gl_update` (triggers > 8000), applied on the next frame.
+    Latest activated profile wins. Toggle turns off when gameplay is interrupted (not the default view, cursor,
+    pause, no focus, panel has the pad), because the game's own aim state isn't read. Log: `profile: <label>`.
 
 ## Dead ends
 

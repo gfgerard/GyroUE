@@ -17,8 +17,10 @@
 #include <gyrolib/version.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <format>
 #include <memory>
@@ -34,7 +36,7 @@ namespace {
 // object property or a subobject name) and, for non-reflected C++ state, raw rotator offsets in it.
 struct View {
     uint32_t id = 1;
-    std::string key = "Default", label = "Camera";
+    std::string key = "Default", label = "Exploration";
     std::string view_target_class;  // active when the view target's class chain has this class
     std::string property;           // rotator property on the view object ("" = ControlRotation)
     std::vector<std::string> object;  // path to the view object (empty = PC for the default view, else ViewTarget)
@@ -65,6 +67,29 @@ struct View {
     bool dump = false, dumped = false;
     std::vector<std::string> watched_values;
 };
+
+// Sensitivity profiles (ADS, ALT_ADS, OTHER): extra GyroLib views (tabs in the panel, inheriting the default view's
+// settings) that replace the default view's settings while their button is held (Hold) or after it is pressed (Toggle).
+// Only in the default view: other camera views (vehicles) keep their own tab. The camera rotation is still written
+// through the default view. A Toggle profile turns off when gameplay is interrupted (no default view, pause, cursor,
+// panel, focus), since GyroUE can't read the game's own aim state. All are off by default: a profile needs both its
+// button and its mode in GyroUE.ini; until then its tab is labelled "<label> - disabled" and says how to enable it.
+struct Profile {
+    uint32_t id = 0;
+    const char* key;  // GyroUE.ini prefix: <key>ProfileButton, <key>ProfileMode
+    const char* label;
+    uint32_t parent;  // settings inheritance (ALT_ADS from ADS)
+    int button = -1;  // SDL_GamepadButton, or kLeftTrigger / kRightTrigger; -1 = disabled
+    std::string button_name;
+    bool registered = false;  // has its tab in the panel
+    bool toggle = false;
+    bool down = false, on = false;
+    uint64_t since = 0;  // activation order: the latest active profile wins
+};
+constexpr int kLeftTrigger = 100, kRightTrigger = 101;
+// ALT_ADS: a second aim (e.g. a scope or an alternative weapon mode) in games that have two.
+Profile g_profiles[] = {{1001, "Ads", "ADS", 1}, {1002, "AltAds", "ALT_ADS", 1001}, {1003, "Other", "OTHER", 1}};
+uint32_t g_last_profile = 0;  // sensitivity profile reported last frame (0 = none)
 
 std::wstring g_mod_dir, g_profile_path, g_exe_stem;
 std::wstring g_settings_path;  // GyroUE\GyroUE.ini (all games)
@@ -268,7 +293,21 @@ const char kDefaultSettings[] =
     ";     the right stick in what the game reads while flick stick is on, keeping PlayStation icons, haptics and\r\n"
     ";     adaptive triggers. Offered after you move the right stick once in game. Needs XInput=1 (with XInput=2 the\r\n"
     ";     game doesn't read the controller itself; flick stick then works through the Xbox controller). 0 = off.\r\n"
-    "NativeFlickStick=0\r\n";
+    "NativeFlickStick=0\r\n"
+    "\r\n"
+    "; Sensitivity profiles, all off by default: extra tabs in the F10 panel (ADS, ALT_ADS for games with a second aim,\r\n"
+    ";     OTHER) that start with the Exploration settings (ALT_ADS: with the ADS settings); change them there. A profile\r\n"
+    ";     needs both its button and its mode (until then its tab says \"- disabled\"). Mode: Hold = while the button is\r\n"
+    ";     held, Toggle = from one press to the next (also off on pause, menus and cutscenes). Not used in other camera\r\n"
+    ";     views (vehicles). Buttons: LT RT LB RB LS RS A B X Y (or L2 R2 L1 R1 L3 R3 Cross Circle Square Triangle),\r\n"
+    ";     Back Start Up Down Left Right Touchpad Misc LP1 LP2 RP1 RP2 (paddles). Restart the game after a change.\r\n"
+    ";     Example: AdsProfileButton=LT and AdsProfileMode=Hold.\r\n"
+    "AdsProfileButton=\r\n"
+    "AdsProfileMode=\r\n"
+    "AltAdsProfileButton=\r\n"
+    "AltAdsProfileMode=\r\n"
+    "OtherProfileButton=\r\n"
+    "OtherProfileMode=\r\n";
 
 void ensure_settings_file() {
     if (GetFileAttributesW(g_settings_path.c_str()) != INVALID_FILE_ATTRIBUTES) return;
@@ -291,6 +330,94 @@ int setting(const wchar_t* key, int fallback) {
     return fallback;
 }
 
+std::string setting_text(const wchar_t* key, const wchar_t* fallback) {
+    wchar_t value[64];
+    for (const std::wstring* path : {&g_profile_path, &g_settings_path})
+        if (GetPrivateProfileStringW(L"GyroUE", key, L"\x01", value, 64, path->c_str()) && value[0] != L'\x01')
+            return narrow(value);
+    return narrow(fallback);
+}
+
+// A profile button name: Xbox or PlayStation names (face buttons by position), case-insensitive. -1 = off/unknown.
+int parse_button(std::string name) {
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::toupper(c)); });
+    static const struct {
+        const char* name;
+        int button;
+    } names[] = {
+        {"LT", kLeftTrigger}, {"L2", kLeftTrigger}, {"RT", kRightTrigger}, {"R2", kRightTrigger},
+        {"LB", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER}, {"L1", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},
+        {"RB", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER}, {"R1", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
+        {"LS", SDL_GAMEPAD_BUTTON_LEFT_STICK}, {"L3", SDL_GAMEPAD_BUTTON_LEFT_STICK},
+        {"RS", SDL_GAMEPAD_BUTTON_RIGHT_STICK}, {"R3", SDL_GAMEPAD_BUTTON_RIGHT_STICK},
+        {"A", SDL_GAMEPAD_BUTTON_SOUTH}, {"CROSS", SDL_GAMEPAD_BUTTON_SOUTH},
+        {"B", SDL_GAMEPAD_BUTTON_EAST}, {"CIRCLE", SDL_GAMEPAD_BUTTON_EAST},
+        {"X", SDL_GAMEPAD_BUTTON_WEST}, {"SQUARE", SDL_GAMEPAD_BUTTON_WEST},
+        {"Y", SDL_GAMEPAD_BUTTON_NORTH}, {"TRIANGLE", SDL_GAMEPAD_BUTTON_NORTH},
+        {"BACK", SDL_GAMEPAD_BUTTON_BACK}, {"VIEW", SDL_GAMEPAD_BUTTON_BACK}, {"CREATE", SDL_GAMEPAD_BUTTON_BACK},
+        {"START", SDL_GAMEPAD_BUTTON_START}, {"MENU", SDL_GAMEPAD_BUTTON_START}, {"OPTIONS", SDL_GAMEPAD_BUTTON_START},
+        {"UP", SDL_GAMEPAD_BUTTON_DPAD_UP}, {"DOWN", SDL_GAMEPAD_BUTTON_DPAD_DOWN},
+        {"LEFT", SDL_GAMEPAD_BUTTON_DPAD_LEFT}, {"RIGHT", SDL_GAMEPAD_BUTTON_DPAD_RIGHT},
+        {"TOUCHPAD", SDL_GAMEPAD_BUTTON_TOUCHPAD}, {"MISC", SDL_GAMEPAD_BUTTON_MISC1},
+        {"RP1", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1}, {"LP1", SDL_GAMEPAD_BUTTON_LEFT_PADDLE1},
+        {"RP2", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2}, {"LP2", SDL_GAMEPAD_BUTTON_LEFT_PADDLE2},
+    };
+    for (const auto& n : names)
+        if (name == n.name) return n.button;
+    return -1;
+}
+
+void load_sensitivity_profiles() {
+    for (Profile& p : g_profiles) {
+        const std::wstring key(p.key, p.key + std::strlen(p.key));
+        const std::string button = setting_text((key + L"ProfileButton").c_str(), L"");
+        std::string mode = setting_text((key + L"ProfileMode").c_str(), L"");
+        std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        const bool mode_ok = mode == "hold" || mode == "toggle";
+        p.button = mode_ok ? parse_button(button) : -1;
+        p.button_name = button;
+        p.toggle = mode == "toggle";
+        if (!button.empty() && parse_button(button) < 0)
+            log("settings: %sProfileButton=%s not recognised", p.key, button.c_str());
+        if (!mode.empty() && !mode_ok) log("settings: %sProfileMode=%s not recognised (Hold or Toggle)", p.key, mode.c_str());
+        if (p.button < 0) log("settings: profile '%s' (view %u) disabled: needs %sProfileButton= and %sProfileMode=", p.label, p.id, p.key, p.key);
+        else log("settings: profile '%s' (view %u) button=%s mode=%s", p.label, p.id, button.c_str(), p.toggle ? "Toggle" : "Hold");
+    }
+}
+
+bool profile_button_down(SDL_Gamepad* pad, int button) {
+    if (button == kLeftTrigger || button == kRightTrigger)
+        return SDL_GetGamepadAxis(pad, button == kLeftTrigger ? SDL_GAMEPAD_AXIS_LEFT_TRIGGER : SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8000;
+    return SDL_GetGamepadButton(pad, SDL_GamepadButton(button));
+}
+
+// Updates the profiles from the selected controller after gl_update: the result is reported on the next frame.
+// gameplay = the default view may turn the camera now.
+void update_sensitivity_profiles(SDL_Gamepad* pad, bool gameplay) {
+    static uint64_t order = 0;
+    for (Profile& p : g_profiles) {
+        const bool down = gameplay && pad && p.button >= 0 && profile_button_down(pad, p.button);
+        const bool pressed = down && !p.down;
+        p.down = down;
+        if (!gameplay) p.on = false;
+        else if (!p.toggle) p.on = down;
+        else if (pressed) p.on = !p.on;
+        if (pressed && p.on) {
+            p.since = ++order;
+            if (p.toggle)  // a newly toggled profile replaces the other toggled one
+                for (Profile& other : g_profiles)
+                    if (&other != &p && other.toggle) other.on = false;
+        }
+    }
+}
+
+uint32_t sensitivity_profile() {
+    const Profile* best = nullptr;
+    for (const Profile& p : g_profiles)
+        if (p.on && (!best || p.since > best->since)) best = &p;
+    return best ? best->id : 0;
+}
+
 // The game's profile describes camera views (a profile can also hold only [GyroUE] settings, e.g. the DualSense
 // learning below): the probe then writes its result as a suggestion instead.
 bool profile_has_views() {
@@ -301,7 +428,7 @@ bool profile_has_views() {
 
 void load_profile() {
     View def;
-    def.label = ini(L"View.Default", L"Label", L"Camera");
+    def.label = ini(L"View.Default", L"Label", L"Exploration");
     def.property = ini(L"View.Default", L"Property");
     load_view_extras(def, L"View.Default");
     g_views = {def};
@@ -314,6 +441,7 @@ void load_profile() {
     const bool notices = setting(L"Notices", 1) != 0;
     log("settings: Probe=%d Notices=%d (GyroUE.ini, the game's profile overrides)", g_probe ? 1 : 0, notices ? 1 : 0);
     notify::set_enabled(notices);
+    load_sensitivity_profiles();
     if (g_probe) {
         const std::wstring probe_path = g_mod_dir + L"\\GyroUE-probe.log";
         const bool opened = probe_log_open(probe_path, probe_header());
@@ -380,6 +508,25 @@ bool start_gyro() {
     for (const View& v : g_views) g_gyro->register_view(v.id, v.label.c_str());
     for (const View& v : g_views)
         if (v.parent) gl_set_context_parent(ctx, v.id, v.parent);
+    // Every profile gets its tab, so the player sees it exists; a disabled one says how to enable it.
+    for (Profile& p : g_profiles) {
+        if (std::any_of(g_views.begin(), g_views.end(), [&](const View& v) { return v.id == p.id; })) {
+            log("profile: view Id=%u is reserved for the '%s' sensitivity profile, profile off", p.id, p.label);
+            p.button = -1;
+            continue;
+        }
+        const std::string label = p.button < 0 ? std::string(p.label) + " - disabled" : p.label;
+        const std::string description =
+            p.button < 0 ? std::format("Disabled. To use it, set {0}ProfileButton= (e.g. LT) and {0}ProfileMode= (Hold or "
+                                       "Toggle) in GyroUE\\GyroUE.ini, then restart the game.", p.key)
+            : p.toggle   ? std::format("Pressing {} turns these settings on, pressing it again turns them off.", p.button_name)
+                         : std::format("These settings are used while {} is held.", p.button_name);
+        g_gyro->register_view(p.id, label.c_str(), GL_OUTPUT_CAMERA, 0, description.c_str());
+        p.registered = true;
+        const bool parent_registered = std::any_of(std::begin(g_profiles), std::end(g_profiles),
+                                                   [&](const Profile& o) { return o.id == p.parent && o.registered; });
+        gl_set_context_parent(ctx, p.id, parent_registered ? p.parent : 1);
+    }
     gl_set_host_capabilities(ctx, GL_HOST_MENU_STATE);
 
     // Mod defaults (an existing gyrolib.ini overrides them): always on, calibrate in menus, no flick stick.
@@ -1381,11 +1528,22 @@ void frame() {
     const uint64_t now_ns = SDL_GetTicksNS();
     update_recenter_support(view, s);
     g_recenter_fraction = 0;
-    const gl_output out = g_input->update(now_ns, host, view_id);
+    // The default view reports the active sensitivity profile instead (decided from last frame's buttons).
+    const uint32_t profile = view_id == 1 ? sensitivity_profile() : 0;
+    if (profile != g_last_profile) {
+        g_last_profile = profile;
+        const char* label = view ? view->label.c_str() : "none";
+        for (const Profile& p : g_profiles)
+            if (p.id == profile) label = p.label;
+        log("profile: %s", label);
+    }
+    const uint32_t gl_view = profile ? profile : view_id;
+    const gl_output out = g_input->update(now_ns, host, gl_view);
     // GyroLib's flick stick needs the game's own right-stick rotation suppressed: possible for the controller shown to
     // the game as XInput, or when the game reads the controller itself through a checked report layout.
     SDL_Gamepad* pad = xinput::selected_gamepad(g_gyro->get(), g_input->get(), out);
     const bool neutral = panel_has_pad(g_gyro->get(), pad);
+    update_sensitivity_profiles(pad, view_id == 1 && host.camera_allowed && host.focused && !s.paused && !neutral);
     xinput::set_neutral(neutral);
     nativepad::set_neutral(neutral);
     // Long-press blocking: the activation button's press is held back from the game, or given to it as a short tap,

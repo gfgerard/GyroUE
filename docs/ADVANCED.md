@@ -179,7 +179,7 @@ Views=InCar
 Probe=0
 
 [View.Default]
-Label=Camera
+Label=Exploration
 ; Optional: another object and rotation for the default view.
 ;   Object=Root.Sub...   Root = PC | Pawn | Camera | ViewTarget; each Sub is an object property name,
 ;                        the name of a subobject (e.g. a component) of the previous object, or @Class:
@@ -308,7 +308,7 @@ what the live test said about it. For Hogwarts Legacy, for example, the probe sh
 ```ini
 ; VERIFIED LIVE: the probe wrote small turns into this rotation and the camera followed them, twice.
 [View.Default]
-Label=Camera
+Label=Exploration
 Object=ViewTarget.BehaviorStack
 Offsets=0x68,0x80
 RotatorSize=12
@@ -392,7 +392,7 @@ character's, so the default view is redirected:
 ```ini
 ; profiles/Cronos-Win64-Shipping.ini
 [View.Default]
-Label=Camera
+Label=Exploration
 Object=Pawn.View
 Offsets=0x2A0,0x420
 RotatorSize=24
@@ -430,7 +430,7 @@ is undone the same frame. `WorldRotation=1` writes both:
 
 ```ini
 [View.Default]
-Label=Camera
+Label=Exploration
 Object=Pawn.FPCamera
 Property=RelativeRotation
 WorldRotation=1

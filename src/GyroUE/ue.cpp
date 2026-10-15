@@ -1663,7 +1663,7 @@ std::string probe_suggestion(const std::string& exe_stem, std::string& summary, 
                 "; can't see (quaternions, input accumulators, animation). See ADVANCED.md, \"Finding the camera of a new game\".\n";
         summary = "no usable candidate";
     } else {
-        text += "[View.Default]\nLabel=Camera\n" + view_lines(*best, "");
+        text += "[View.Default]\nLabel=Exploration\n" + view_lines(*best, "");
         summary = best->object + (best->property.empty() ? std::format(" raw x{}", best->offsets.size()) : "." + best->property) +
                   (best->world ? " (WorldRotation)" : "") + (verified ? ", verified live" : ", not verified");
     }
