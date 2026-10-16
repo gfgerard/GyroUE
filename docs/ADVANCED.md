@@ -52,6 +52,7 @@ play.
 | Hogwarts Legacy | UE 4 | yes | Third person detached camera, new objects detected. Native DualSense (delay-loaded `libScePad.dll`): XInput translation stays off. |
 | Visage | UE 4  | no | First person camera XInput translation/Steam input needed. |
 | Valor Mortis | UE 5.7 | no |  |
+| PAYDAY 3 | UE 5 | no | Generic path. Case-preserving names build (`WITH_CASE_PRESERVING_NAME`): GyroUE detects the different name pool layout by itself. Native DualSense (HID): XInput translation stays off. Always-online co-op game: use at your own risk, private or solo lobbies only. |
 
 Tested with a DualSense over USB/BT and Nintendo Switch Pro Controller. Requirements and limits:
 

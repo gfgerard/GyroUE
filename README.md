@@ -167,6 +167,7 @@ doesn't follow the gyro, GyroUE tells you on screen, and [Advanced](docs/ADVANCE
 | Mortal Shell | ✅ Works | **No `F10` panel** (DX11): change settings in `gyrolib.ini`. The game's own PlayStation support only knows the DualShock 4: its profile makes GyroUE show your DualSense (USB or Bluetooth) to it as one, with PlayStation icons, rumble and light bar. |
 | Visage | ✅ Works | **No `F10` panel** (DX11): change settings in `gyrolib.ini`. |
 | Valor Mortis | ✅ Works |  |
+| PAYDAY 3 | ✅ Works |  |
 
 
 ## Current scope

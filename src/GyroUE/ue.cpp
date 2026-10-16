@@ -130,6 +130,11 @@ int g_item_stride = 0;       // sizeof(FUObjectItem)
 int g_item_object = 0;       // FUObjectItem::Object: +0, or +8 in UE 5.7 (a 64-bit flags/refcount field first)
 uintptr_t g_name_blocks = 0; // FNamePool Blocks[]
 bool g_header_len_high = true;  // FNameEntryHeader: Len in bits 6..15 (true) or 0..9
+// WITH_CASE_PRESERVING_NAME builds: entries are ComparisonId (4 bytes), header (bIsWide bit 0, Len bits 1..15),
+// characters, 4-byte aligned. FName is ComparisonIndex, Number, DisplayIndex (12 bytes), so UObject::Outer moves
+// from +0x20 to +0x28.
+bool g_name_case_preserving = false;
+int g_obj_outer = 0x20;
 // UE <= 4.22 has no FNamePool: TNameEntryArray (GNames) holds Chunks[128] of FNameEntry*[16384], then NumElements,
 // NumChunks. FNameEntry: Index (name index << 1 | wide), HashNext, then the NUL-terminated characters.
 uintptr_t g_name_chunks = 0;    // TNameEntryArray::Chunks
@@ -192,14 +197,19 @@ std::string legacy_entry_string(uint32_t index) {
 
 std::string entry_string(uint32_t index) {
     if (g_name_chunks) return legacy_entry_string(index);
-    const uint32_t block = index >> 16, offset = (index & 0xFFFF) * 2;
+    const uint32_t block = index >> 16;
+    uint32_t offset = (index & 0xFFFF) * (g_name_case_preserving ? 4 : 2);
     if (block >= 8192) return {};
     const uintptr_t base = rdp(g_name_blocks + block * 8ull, 2);
     if (!base) return {};
+    if (g_name_case_preserving) offset += 4;  // past the ComparisonId
     uint16_t h = 0;
     if (!rd(base + offset, h)) return {};
-    const bool wide = g_header_len_high ? (h & 1) : (h >> 15) & 1;
-    const uint32_t len = g_header_len_high ? (h >> 6) : (h & 0x3FF);
+    bool wide;
+    uint32_t len;
+    if (g_name_case_preserving) wide = h & 1, len = h >> 1;
+    else if (g_header_len_high) wide = h & 1, len = h >> 6;
+    else wide = (h >> 15) & 1, len = h & 0x3FF;
     if (len == 0 || len > 1024) return {};
     if (!wide) {
         std::string s(len, '\0');
@@ -488,9 +498,15 @@ bool find_name_pool(const std::vector<Range>& sections) {
         for (uintptr_t a = r.begin + 8; a + 8 <= r.end; a += 8) {
             const uintptr_t block0 = rdp(a, 2);
             if (!block0) continue;
-            char bytes[24] = {};
+            char bytes[32] = {};
             if (!guarded_copy(bytes, block0, sizeof(bytes))) continue;
-            if (std::memcmp(bytes + 2, "None", 4) != 0 || std::memcmp(bytes + 8, "ByteProperty", 12) != 0) continue;
+            // Case-preserving names (WITH_CASE_PRESERVING_NAME, PAYDAY 3): each entry starts with its 4-byte
+            // ComparisonId, then a header with bIsWide in bit 0 and Len above it; entries are 4-byte aligned.
+            const bool case_preserving = std::memcmp(bytes + 6, "None", 4) == 0 &&
+                                         std::memcmp(bytes + 0x12, "ByteProperty", 12) == 0;
+            if (!case_preserving &&
+                (std::memcmp(bytes + 2, "None", 4) != 0 || std::memcmp(bytes + 8, "ByteProperty", 12) != 0))
+                continue;
             uint32_t current_block = 0;
             if (!rd(a - 8, current_block) || current_block >= 8192) continue;
             if (!rdp(a + current_block * 8ull, 2)) continue;
@@ -502,6 +518,14 @@ bool find_name_pool(const std::vector<Range>& sections) {
             for (uint32_t b = current_block + 1; b <= current_block + 4 && b < 8192 && in_order; ++b)
                 in_order = rdp(a + b * 8ull, 2) == 0;
             if (!in_order) continue;
+            if (case_preserving) {
+                const uint16_t h = uint16_t(uint8_t(bytes[4]) | (uint8_t(bytes[5]) << 8));
+                if (h != 4 << 1) continue;
+                g_name_case_preserving = true;
+                g_obj_outer = 0x28;
+                g_name_blocks = a;
+                return true;
+            }
             const uint16_t h = uint16_t(uint8_t(bytes[0]) | (uint8_t(bytes[1]) << 8));
             if ((h >> 6) == 4 && !(h & 1)) g_header_len_high = true;
             else if ((h & 0x3FF) == 4) g_header_len_high = false;
@@ -746,7 +770,9 @@ bool init() {
     }
     if (!g_name_blocks && find_name_pool(sections))
         log("ue: FNamePool.Blocks at %s (header len %s)", module_offset(g_name_blocks).c_str(),
-            g_header_len_high ? "high bits" : "low bits");
+            g_name_case_preserving ? "case-preserving entries, Outer +0x28"
+            : g_header_len_high    ? "high bits"
+                                   : "low bits");
     // UE <= 4.22: no pool, the older name table. Only once the objects are found, so a pool that a later try
     // would find (4.23+) isn't passed over.
     if (!g_name_blocks && !g_name_chunks && g_obj_array && find_legacy_names(sections))
@@ -792,14 +818,14 @@ Obj find_instance(const char* class_name) {
     return 0;
 }
 
-Obj outer_of(Obj o) { return o ? rdp(o + 0x20) : 0; }
+Obj outer_of(Obj o) { return o ? rdp(o + g_obj_outer) : 0; }
 
 Obj find_subobject(Obj outer, const char* name) {
     if (!g_ready || !outer) return 0;
     const int32_t n = object_count();
     for (int32_t i = 0; i < n; ++i) {
         const Obj o = object_at(i);
-        if (o && rdp(o + 0x20) == outer && fname(o + kObjName) == name) return o;
+        if (o && rdp(o + g_obj_outer) == outer && fname(o + kObjName) == name) return o;
     }
     return 0;
 }
@@ -809,7 +835,7 @@ Obj find_subobject_of_class(Obj outer, const char* class_name) {
     const int32_t n = object_count();
     for (int32_t i = 0; i < n; ++i) {
         const Obj o = object_at(i);
-        if (o && rdp(o + 0x20) == outer && !is_cdo(o) && is_a(o, class_name)) return o;
+        if (o && rdp(o + g_obj_outer) == outer && !is_cdo(o) && is_a(o, class_name)) return o;
     }
     return 0;
 }
@@ -969,8 +995,6 @@ bool write_number(Obj o, const char* name, double value) {
 // ---------------------------------------------------------------- probe (snapshot diff)
 
 namespace {
-
-constexpr int kObjOuter = 0x20;
 
 struct Leaf {
     std::string label;
@@ -1307,13 +1331,13 @@ size_t probe_snapshot(const std::vector<std::pair<std::string, Obj>>& roots) {
         for (int d = 0; x && d < 8 && role.empty(); ++d) {
             for (const auto& [r_name, r] : roots)
                 if (r && x == r && role.empty()) role = r_name;
-            if (role.empty()) x = rdp(x + kObjOuter);
+            if (role.empty()) x = rdp(x + g_obj_outer);
         }
         if (role.empty()) continue;
         found.push_back({o, x, role});
         if (o == x) continue;
         Obj c = class_of(o);
-        for (int depth = 0; c && depth < 64; ++depth, c = rdp(c + g_super)) first_of.try_emplace({rdp(o + kObjOuter), name_of(c)}, o);
+        for (int depth = 0; c && depth < 64; ++depth, c = rdp(c + g_super)) first_of.try_emplace({rdp(o + g_obj_outer), name_of(c)}, o);
     }
     // A path step: the object's name, or "@Class" when the name is generated ("<Class>_<number>", a new number every
     // session, e.g. Hogwarts Legacy's CameraStackBehaviorConvertToTranslation_2147460121) and "@Class" finds it.
@@ -1323,7 +1347,7 @@ size_t probe_snapshot(const std::vector<std::pair<std::string, Obj>>& roots) {
                                name[cls.size()] == '_' &&
                                name.find_first_not_of("0123456789", cls.size() + 1) == std::string::npos;
         if (generated) {
-            const auto it = first_of.find({rdp(y + kObjOuter), cls});
+            const auto it = first_of.find({rdp(y + g_obj_outer), cls});
             if (it != first_of.end() && it->second == y) return "@" + cls;
         }
         return name;
@@ -1331,7 +1355,7 @@ size_t probe_snapshot(const std::vector<std::pair<std::string, Obj>>& roots) {
     std::vector<std::pair<Obj, std::string>> objects;
     for (const Found& f : found) {
         std::string path = f.role;
-        for (Obj y = f.o; y && y != f.root; y = rdp(y + kObjOuter)) {
+        for (Obj y = f.o; y && y != f.root; y = rdp(y + g_obj_outer)) {
             const size_t root_len = path.find('.') == std::string::npos ? path.size() : path.find('.');
             path.insert(root_len, "." + step(y));
         }

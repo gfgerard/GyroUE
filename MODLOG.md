@@ -1464,6 +1464,37 @@ or gyro to stick.
   `<Key>ProfileMode=` in GyroUE.ini, all off by default, "- disabled" tabs with a description); default view
   labelled "Exploration". Tested in game: not yet (Cronos has this build, ADS on LT Hold).
 
+- 2026-10-16 **PAYDAY 3 (Steam, UE 5.x, exe `PAYDAY3-Win64-Shipping.exe`, online co-op, no anti-cheat folder seen),
+  GyroUE 0.9.0: engine not readable.** GUObjectArray found (exe+0x919F9A0, stride 0x18, 50k objects at boot, 203k in
+  the main menu) but no `FNamePool` line, `view=none` all session and the 60 s notice. The game reads the DualSense
+  itself (HID.DLL import, report 0x01, long-press blocking available).
+  - **Root cause: a `WITH_CASE_PRESERVING_NAME` build.** Read-only `ReadProcessMemory` look at the main menu: the pool
+    is in `.data` at **rva 0x90CC410** (CurrentBlock 0x37), but each entry is `ComparisonId` (uint32, equal to the
+    entry's own index), then a header with **bIsWide in bit 0 and Len in bits 1..15** (no probe hash), then the
+    characters, **4-byte aligned** (offset in block = (index & 0xFFFF) * 4). Block 0: `None` header at +4, chars at +6;
+    `ByteProperty` id 3 at +0xC, chars at +0x12. `find_name_pool` looked for `None` at +2 and `ByteProperty` at +8.
+  - FName is 12 bytes (ComparisonIndex, Number, DisplayIndex), so **UObject::Outer is at +0x28** (Name 0x18; Class
+    0x10 and InternalIndex 0x0C unchanged). Checked: Object/Actor outer `/Script/CoreUObject` / `/Script/Engine`.
+  - Reflection checked against the live game with the new decoding: Class, Object, Actor, Controller found;
+    SuperStruct 0x48, ChildProperties 0x58; FField Next 0x18, **Name 0x20** (DisplayIndex at 0x28, flags 0x2C;
+    `fname()` reads the flags as Number there, so +0x28 doesn't match), ArrayDim 0x30, ElementSize 0x34 (24: double
+    rotator), Offset_Internal 0x44 (ControlRotation at +0x3A8), sizeof(FProperty) 0x78, type `StructProperty`.
+    `detect_layout` finds all of these without changes.
+  - Fix (`ue.cpp`): `find_name_pool` also accepts the case-preserving block 0 (`None` at +6, `ByteProperty` at
+    +0x12, header 0x0008) and sets `g_name_case_preserving` and `g_obj_outer = 0x28`; `entry_string` decodes those
+    entries; every Outer read (`outer_of`, `find_subobject*`, the probe's object paths) uses `g_obj_outer`. Log:
+    `FNamePool.Blocks at ... (header len case-preserving entries, Outer +0x28)`.
+  - Built (no version bump). Online game: outside the ground rule (offline only); the user asked for it.
+  - **Tested (user, DualSense, Probe=0): works** with the generic `ControlRotation` view, no profile needed.
+    Connection (USB/BT) and Steam Input state not reported. Other games not re-tested: the stock pool path is
+    unchanged (a stock block 0 has the `ByteProperty` header at +6, never `None`).
+
+- 2026-10-16 **Build: GyroUE 0.9.1** (version chosen by the user), `build/release/GyroUE-v0.9.1.zip`. Since 0.9.0:
+  case-preserving FName pools (`WITH_CASE_PRESERVING_NAME` builds: 4-byte ComparisonId per entry, bIsWide:1 Len:15
+  header, 4-byte aligned entries, UObject::Outer at +0x28), which makes PAYDAY 3's engine readable. Tested in game:
+  PAYDAY 3 (user, DualSense, generic view). Not re-tested on other games. PAYDAY 3 added to the README and ADVANCED
+  game tables with an online-game warning (zip repackaged).
+
 ## Dead ends
 
 (none yet)
