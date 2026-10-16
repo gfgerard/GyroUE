@@ -1495,6 +1495,129 @@ or gyro to stick.
   PAYDAY 3 (user, DualSense, generic view). Not re-tested on other games. PAYDAY 3 added to the README and ADVANCED
   game tables with an online-game warning (zip repackaged).
 
+- 2026-10-16 **PAYDAY 3 report (another user, GyroUE 0.9.1): "the gyro stops after an in-game action that changes
+  the camera".** Their log: Steam Input handles the pad (`Steam Controller not shown`), UE4SS installed, 2560x1440.
+  View `Exploration` and target `CH_*_C` (the pawn) never change while it's stopped, no pause or cursor, but
+  `applied yaw/pitch` freeze for minutes with `still=1`: GyroUE wrote nothing, so GyroLib produced no rotation; a
+  camera ignoring ControlRotation would still show `applied` growing. Freezes start right after a status line with
+  `motion=0 samples=0`, each next to a `ResizeBuffers` and Raw Input re-registrations; `enabled=0` in most status
+  lines. Not explained: no focus, GyroLib permission or sensor transitions were logged.
+  - Added (built, no version bump, not tested in game yet): transition lines, each held 0.5-3 s before logging:
+    `focus: the game window is in front` / `lost to <exe> (window class ...)`, `gyro: GyroLib enables / suspends
+    the gyro`, `gyro: motion data available / lost`, `gyro: motion source N`, `gyro: the controller reads as lying
+    still / moves`, `gyro: GyroLib's sample count restarted (a -> b)`.
+  - Follow check re-armed: it keeps running after its verdict and logs `camera: stopped following the gyro (...)`
+    after 3 ignored 2 s windows in a row (2 was tried, see below), `camera: follows the gyro again`, with the view target, camera manager
+    class and `CameraStyle` (`value_string` now reads NameProperty). The POV is read every frame (offsets cached);
+    `g_need_pov` removed. Notices unchanged (once per session).
+  - **Tested (user, own PAYDAY 3 session): caught.** `camera: stopped following the gyro (ControlRotation, view
+    'Exploration'; last window: gyro 1354 degrees, camera 1) - target CH_Star_C, camera manager
+    BP_PlayerCameraManager_C` (no `CameraStyle` property). The stick and the mouse still turn the camera there.
+  - **Probe in that scene (Probe=1, automatic, 4 captures):** verified **`Camera.@SBZClampCameraRotationModifier` raw
+    +0x68 (double rotator)**, "MOVES THE CAMERA ... it also turns the character", twice; ControlRotation, both POV
+    caches and `TransformComponent0.RelativeRotation` are outputs there. The modifier was a candidate in captures 2
+    and 4 only (not in 1 and 3, same scene): it isn't always active. The probe wrote it as `[View.Default]`, which
+    would replace ControlRotation in normal play too (not tested). Also seen: 30 turns discarded as "the right stick
+    wasn't used" (mouse turns), and POV pitch deltas not wrapped ("347 up/down" for -13).
+
+- 2026-10-16 **Learning cameras during play (user's request: "detect new cameras without leaving the game, by key or
+  automatically, and save them in the game's profile").** Built (no version bump), unit tests pass (126 checks),
+  **not tested in game yet**.
+  - **`Match=Camera` views** (`camera_match.hpp`, `profile.hpp`): a view without ViewTargetClass (or with one as a
+    filter) that is active while the camera follows its rotation. The base view (ViewTargetClass view, else default)
+    and the Match views for the view target form a group; the gyro goes to the current member; a member is judged
+    over >= 3 degrees of gyro and >= 0.3 s (lag-tolerant), ignored (< 0.2 of it reached the camera, no stick/mouse)
+    -> next member, followed (> 0.5) -> stays; all ignored -> base view, 2 s rest; a member whose object is missing
+    is skipped at once. Logs `camera: '<a>' ignores the gyro, trying '<b>'` (20 per session),
+    `camera: the camera follows view '<b>' now (Match=Camera)`, `camera: no view of this camera follows the gyro`.
+    Sensitivity profiles apply to the Match views of the default view too.
+  - **Profile hot reload:** the profile's write time is checked every second; on change its views are read again,
+    new ones registered with GyroLib (`gl_register_gameplay_context` after start), removed ones unregistered. View
+    loading moved to `profile.cpp` (`load_views`); duplicate view ids are now rejected.
+  - **Probe during play:** `ProbeKey=Ctrl+F7` starts it (and cancels any probe); `AutoProbe=1` (default) starts it
+    when the follow check says `stopped following` or `the game ignores it`, max 3 per session, 30 s apart; an
+    automatic one keeps the gyro on until its live test and gives up after 45 s without a capture or when the camera
+    follows the gyro again. `ue::probe_reset` forgets earlier captures/verdicts. A verified camera of a probe started
+    during play, or of any probe in a game that already has a profile, is **appended** as `[View.Auto<id>]` with
+    `Match=Camera`, `Parent=1` and a comment (date, view target, live-test note); `Views=` updated, everything else
+    kept, duplicates (same object + property/offsets, incl. the default's PC.ControlRotation) not added; ids skip
+    the sensitivity profiles' 1001-1003. Only a `Probe=1` probe in a game without a profile still writes
+    `[View.Default]`.
+  - **Mouse look** counts as look input everywhere the right stick did (probe captures, live-test aborts, follow
+    check, camera check): the `PeekMessageW` hook passes `WM_INPUT` to `host_raw_input`, which reads relative mouse
+    motion with `GetRawInputData` (never consumes it). Plain F7/F8 only (with Ctrl/Shift/Alt they may be the probe key).
+  - **Probe pitch wrap fix:** POV pitch deltas (captures, live test, follow check) and the diff's candidate matching
+    (`follows`, scalar labels) now wrap: UE5 keeps pitch as 0..360, so a turn across level read as ~350 degrees and a
+    rotator stored as -10 didn't match a POV of 350.
+  - Tests: `tools/test-gyroue.sh` builds `gyroue_tests` (tests/profile_tests.cpp): Match group (follow, switch, lag,
+    look input, cutscene rest, missing object, round trip normal -> scene -> normal with a simulated camera) and
+    profile (load, invalid views, add to a new/existing file, settings kept, duplicates, reserved ids).
+  - Not done: "verify by playing" (trying unverified candidates with the gyro instead of the live test).
+  - **Tested in PAYDAY 3 (user): the Match=Camera profile works.** Hand-written profile: default view
+    (ControlRotation) + `[View.Clamp]` Id=2, `Match=Camera`, `Camera.@SBZClampCameraRotationModifier` +0x68,
+    RotatorSize=24. In a ~6 min session: 21 "trying" switches, 24 "follows view" lines, both directions; a switch
+    takes 0.3-1.2 s of gyro motion; never `no view of this camera follows the gyro`, no AutoProbe start. The clamp
+    camera turns out to be frequent (many short actions). While a security camera was the view target
+    (`BP_SecurityCamera_C`, taken as the player's camera from the right stick) the default view followed.
+    User: "worked perfectly". Profile shipped as `profiles/PAYDAY3-Win64-Shipping.ini`. Hot reload, the probe key,
+    AutoProbe and add_view still untested in game.
+  - **"Stopped following" after 2 ignored windows (was 3), user's decision:** about 4 s of gyro instead of 6 before
+    AutoProbe starts, for PAYDAY 3's short actions. One window alone stays too weak (pitch limit, camera blends,
+    hitches). The first verdict ("the game ignores it") keeps 3. Built, tests pass, not deployed yet.
+  - **AutoProbe tested in PAYDAY 3 (user, with 2 windows; profile reduced to the default view): works end to end.**
+    17:52:01 `stopped following` (gyro 772 deg, camera 1) -> probe started -> 3 scored captures in 16 s -> live test
+    of 5 rotations -> 17:52:24 `camera learned: Camera.@SBZClampCameraRotationModifier raw x1 added ... as view 2`
+    -> 17:52:25 `the profile file changed, views read again` (2 views) -> 17:52:30 `the camera follows view
+    'SBZClampCameraRotationModifier' now (Match=Camera)`, then normal switching both ways, no restart. The appended
+    `[View.Auto2]` has its comment (date, view target CH_Star_C, live-test note); Windows put the new `[GyroUE]
+    Views=Auto2` section at the end of the file (fine for the INI reader). Label = the modifier's class name (long).
+  - **But a false positive first:** 17:51:18 `stopped following` after two windows (last one: gyro 14 deg, camera 0),
+    during another action; the camera followed again at 17:51:20 and the automatic probe stopped by itself
+    (`the camera follows the gyro again`), but it showed its notice and used one of the 3 automatic starts.
+    **Back to 3 windows (user's decision).** Built, tests pass; deployed with the shipped profile.
+  - Shipped profile reworked from the user's renamed one: view `Clamp` (Label `Clamp Camera`), clean header. The
+    user's copy had `Views=Clamp <space><tab>`: `split` trimmed only spaces, so the view could be lost; it now trims
+    tabs too (test added).
+
+- 2026-10-16 **Match=Camera switches without the dead second (user: "when the camera changes the gyro seems not to
+  work for a moment, easily a second").** Cause: the camera check needed 3 degrees over 0.3 s on the wrong view,
+  and all that gyro was lost. Built (no version bump), tests pass (353 checks), **not tested in game yet**.
+  - **Fast path:** with more than one member, host.cpp reads the current view's rotation (yaw) before and after each
+    gyro write (`g_write_back`) and, the next frame, `CameraMatch::rewritten` says whether the game put it back (1),
+    kept it (0) or can't tell (-1: write < 0.05 deg, or moved for other reasons). Yaw only: the pitch limit clamps
+    pitch writes back, which isn't a rewrite. 3 put-back frames in a row drop the view (~30-50 ms):
+    `camera: '<a>' is rewritten by the game, trying '<b>'`. A single put-back (recoil) doesn't.
+  - **Slow path** (a rotation the game neither rewrites nor reads, e.g. maybe the modifier after its action) now
+    judges over 2 deg / 0.2 s (was 3 / 0.3): `... is ignored by the camera ...`.
+  - **Carry-over:** the gyro the dropped view lost is written into the new view in the same frame: the put-back
+    writes (fast), or the unfollowed share of the window plus the last followed/unclear windows' share (slow; a
+    window that followed for 150 ms and was ignored for 50 still loses those 50), at most 45 deg per axis; nothing
+    when every view was ignored (cutscene). Logged as `(N degrees carried over)`. Simulated round trip normal ->
+    clamp -> normal: 180.3 of 180 degrees reached the camera (one frame of rounding).
+  - Switch lines are logged up to 200 per session (was 20): PAYDAY 3 changes camera every few seconds.
+  - To check in PAYDAY 3: which path each direction takes (entry should be `rewritten`, exit unknown), how the switch
+    feels, and that no false switches appear in normal play (recoil, pitch limit).
+  - **Tested in PAYDAY 3 (user): entry works (`'Exploration' is rewritten by the game`, 0.2-7 deg carried), exit
+    takes the slow path (`'Clamp Camera' is ignored by the camera`). But looking straight up or down froze the
+    camera.** Cause: the slow path summed yaw and pitch; at the pitch limit the camera ignores pitch writes, so the
+    clamp view was judged ignored -> Exploration (rewritten in the action, fast path) -> every view failed ->
+    `no view of this camera follows the gyro` and a 2 s rest **on the base view**, which the action ignores: a 2 s
+    freeze. The pitch pushed into the limit was also carried over (46-53 deg per switch; applied pitch 482.8).
+  - Fix: the slow path and the follow check (`stopped following`, AutoProbe, the first verdict) judge **yaw only**
+    (`CameraMatch::Frame::moved` is the camera's yaw, the window counts the gyro's yaw; pitch-only motion gives no
+    verdict); pitch carry-over capped at 10 deg (yaw 45); when every view failed, the group rests on **the view the
+    camera followed last** (else the base). The earlier AutoProbe false positive (two windows, 14 deg, camera 0)
+    may have been the same pitch-limit effect. Tests: 368 checks (pitch limit with and without yaw, all-ignored
+    keeps the followed view, pitch carry cap). Built, not deployed yet.
+  - **Tested in PAYDAY 3 (user): fixed.** No freeze at the pitch limits; camera switches accepted ("lo doy por
+    bueno"). Still untested in game: the probe key (Ctrl+F7) and the profile hot reload after a hand edit.
+
+- 2026-10-16 **Build: GyroUE 0.9.1 repackaged** (user's request, same version), `build/release/GyroUE-v0.9.1.zip`:
+  now also the diagnostics logging, Match=Camera views with fast switching and carry-over (yaw-only judging),
+  profile hot reload, the probe during play (ProbeKey/AutoProbe, mouse turns), the probe pitch-wrap fix, and the
+  shipped `profiles/PAYDAY3-Win64-Shipping.ini`. Zip checked: winmm.dll and the PAYDAY 3 profile identical to the
+  build/repo, no tests, logs or user settings inside.
+
 ## Dead ends
 
 (none yet)

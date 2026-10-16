@@ -52,7 +52,7 @@ play.
 | Hogwarts Legacy | UE 4 | yes | Third person detached camera, new objects detected. Native DualSense (delay-loaded `libScePad.dll`): XInput translation stays off. |
 | Visage | UE 4  | no | First person camera XInput translation/Steam input needed. |
 | Valor Mortis | UE 5.7 | no |  |
-| PAYDAY 3 | UE 5 | no | Generic path. Case-preserving names build (`WITH_CASE_PRESERVING_NAME`): GyroUE detects the different name pool layout by itself. Native DualSense (HID): XInput translation stays off. Always-online co-op game: use at your own risk, private or solo lobbies only. |
+| PAYDAY 3 | UE 5 | yes (shipped) | Generic path in normal play; during some actions the camera is turned by a camera modifier (`SBZClampCameraRotationModifier`, raw +0x68), which the profile adds as a `Match=Camera` view: GyroUE switches to it and back by itself. Case-preserving names build (`WITH_CASE_PRESERVING_NAME`): GyroUE detects the different name pool layout by itself. Native DualSense (HID): XInput translation stays off. Always-online co-op game: use at your own risk, private or solo lobbies only. |
 
 Tested with a DualSense over USB/BT and Nintendo Switch Pro Controller. Requirements and limits:
 
@@ -79,6 +79,10 @@ All diagnostics go to `GyroUE\GyroUE.log` (probe results, if enabled, to `GyroUE
 | `motion=0` in the status line | The controller isn't visible to SDL: close remappers, try USB, check Steam Input. |
 | `view=none` in gameplay | The pawn is missing or a placeholder. The game may need a profile. |
 | `applied yaw` changes but the camera doesn't move | Custom camera: see [Finding the camera](#finding-the-camera-of-a-new-game). |
+| `camera: '<view>' is rewritten by the game` (or `is ignored by the camera`), `trying '<next>' (N degrees carried over)` / `the camera follows view '<view>' now (Match=Camera)` | The game switched between rotations of the same view target and GyroUE followed it (see [Several cameras for the same view target](#several-cameras-for-the-same-view-target-matchcamera)). |
+| `probe: started during play (...)` / `probe: camera learned: ...` / `probe: stopped (...)` | A probe started from the probe key or by AutoProbe, and what became of it (see [Learning a camera during play](#learning-a-camera-during-play-no-restart)). |
+| `profile: the profile file changed, views read again` | The profile was edited, or the probe added a view: its views apply at once. |
+| The gyro stops mid-game, `gyro on` still logged | Look at the lines just before: `focus: lost to <program> (window class ...)` (another window is in front), `gyro: GyroLib suspends the gyro` (activation mode, focus, pause, menus or calibration), `gyro: motion data lost`, `gyro: GyroLib's sample count restarted` (the controller was reopened) or `gyro: the controller reads as lying still` while you hold it (no real gyro data). If `applied yaw` keeps changing, `camera: stopped following the gyro (...) - target ..., camera manager ..., CameraStyle ...` names the camera that took over. |
 | Camera drifts slowly | Rest the pad in a menu for a few seconds (`bias=` in the status line should become non-zero) or use "Recalibrate gyro". |
 | Panel doesn't open | Look for `overlay:` lines. Try from the game's pause menu. As a fallback, edit `gyrolib.ini` directly. |
 | Double motion | Steam Input or another tool is also converting the gyro to mouse. |
@@ -210,7 +214,45 @@ OnGyro=IsAutoControlling:0,Camera_AutoControlAmount_target:0
 ; Diagnostics: log properties on change / dump all properties once.
 ;Watch=IsAutoControlling
 ;Dump=1
+
+[View.Auto3]
+Id=3
+Label=SBZClampCameraRotationModifier
+; Active while the camera follows this rotation, instead of the view for the same view target (see below).
+; Optional ViewTargetClass= limits it to that view target; without it, it applies to every one.
+Match=Camera
+Parent=1
+Object=Camera.@SBZClampCameraRotationModifier
+Offsets=0x68
+RotatorSize=24
 ```
+
+The profile is read again whenever the file changes, so edits (and views the probe adds) apply without a restart.
+
+### Several cameras for the same view target (`Match=Camera`)
+
+Some games turn the camera through different rotations while the view target stays the same. PAYDAY 3 uses
+`ControlRotation` in normal play, but during some actions a camera modifier (`SBZClampCameraRotationModifier`) clamps
+the view and rewrites `ControlRotation` from its own rotation. `ViewTargetClass` can't tell these apart, so such a view
+uses `Match=Camera` instead:
+
+- The base view (the `ViewTargetClass` view for the view target, or the default view) and the `Match=Camera` views
+  for that view target form a group. The gyro turns the group's current view.
+- The current view is dropped for the next one as soon as the game shows it isn't the camera's input:
+  - **fast:** the game puts its rotation back after each gyro write (it rewrites it from the real input), 3 frames
+    in a row: `camera: '<view>' is rewritten by the game, trying '<next>'`;
+  - **slow:** the camera ignores the gyro written into it (at least 2 degrees over at least 0.2 s, no right stick or
+    mouse), for a rotation the game neither rewrites nor reads: `... is ignored by the camera, trying ...`.
+  The one the camera follows stays: `camera: the camera follows view '<view>' now (Match=Camera)`.
+- Both checks judge yaw only: at the pitch limit (looking straight up or down) every camera ignores pitch, which
+  isn't a camera change.
+- The gyro the dropped view lost is written into the next one at once (`(N degrees carried over)`, at most 45 of yaw
+  and 10 of pitch), so a camera change delays the turn a moment instead of eating it.
+- If no view of the group moves the camera (a cutscene, or a camera held at a yaw limit), the view the camera followed
+  last is used and the group waits 2 s before trying again: `camera: no view of this camera follows the gyro`.
+- A view whose object doesn't exist right now (the modifier only exists during the action) is skipped at once.
+- Each `Match=Camera` view has its own tab in the settings panel, starting with the settings of view 1. ADS, ALT_ADS
+  and OTHER also apply to the `Match=Camera` views of the default view.
 
 ## Finding the camera of a new game
 
@@ -238,8 +280,11 @@ camera: the gyro turned ControlRotation (view 'Camera') by 412 degrees but the c
         with the right stick.
 ```
 
-The check only runs on the player's own camera (view target = pawn), so scripted or fixed cameras don't trigger it,
-and it stops once it has a verdict. The warning also appears **on screen**, in a small box at the top of the game
+The check only runs on the player's own camera (view target = pawn), so scripted or fixed cameras don't trigger it.
+The first verdict needs three 2 s windows with at least 10° of gyro each and no stick or mouse. After it, the check
+keeps watching and logs `camera: stopped following the gyro` after three such windows in a row (about 6 s of gyro motion),
+`follows the gyro again` when it does; AutoProbe starts from the first one (see
+[Learning a camera during play](#learning-a-camera-during-play-no-restart)). The warning also appears **on screen**, in a small box at the top of the game
 window, with what to do next; so do the probe's progress messages below (capture ready, capture done, turn
 discarded, suggested profile written). The box is drawn by Windows, not by the game, so it works with DX11 and DX12;
 it doesn't show in exclusive fullscreen. `Notices=0` in `GyroUE\GyroUE.ini` keeps the messages in the log only.
@@ -270,7 +315,7 @@ Probe=1
 `GyroUE.ini` holds the settings for every game in that folder. A game's profile
 (`GyroUE\profiles\<game exe>.ini`) can override any of them in its own `[GyroUE]` section.
 
-`GyroUE.log` now says `profile: probe enabled (automatic capture on stick turns, F7/F8 manual), results in ...GyroUE-probe.log`. The
+`GyroUE.log` now says `probe: results in ...GyroUE-probe.log` and `profile: probe enabled (automatic capture on stick or mouse turns, F7/F8 manual)`. The
 probe writes its results to that separate file, `GyroUE\GyroUE-probe.log`, which starts with a short reminder of
 these steps; `GyroUE.log` only gets one line per snapshot and diff. `F7` and `F8` are polled only while
 the game window has focus. If the game uses those keys for something, press them where that doesn't matter
@@ -475,6 +520,27 @@ when one exists, and note the game version in the profile.
 - **Not covered:** objects that aren't subobjects of those roots (e.g. a separate camera actor that isn't the view
   target, world subsystems) and plain C++ heap data that isn't stored inside a UObject. For those, a debugger or
   memory scanner is needed. The probe only reads memory and never writes.
+
+### Learning a camera during play (no restart)
+
+The probe can also start in the middle of a game, for the camera of that moment, without `Probe=1` or a restart:
+
+- **Probe key** (`ProbeKey=Ctrl+F7` in `GyroUE.ini`; F1..F24 with optional `Ctrl+`, `Shift+`, `Alt+`; empty = none):
+  starts the probe where you are. The same key cancels any probe, also one started with `Probe=1`.
+- **Automatically** (`AutoProbe=1`, the default): when a camera that followed the gyro stops following it
+  (`camera: stopped following the gyro`), or the game's camera ignores the gyro from the start, the probe starts by
+  itself and says so on screen. The gyro stays on meanwhile (the camera ignores it anyway); if the camera follows the
+  gyro again, or no turn with the stick or mouse is captured in 45 s (a cutscene), it gives up. At most 3 automatic
+  starts per session, 30 s apart.
+
+Then turn the camera with the **right stick or the mouse** (more than 30°), stop, 3 times, and leave the controller
+alone during the short live test. The verified rotation is **added to the game's profile** as a new
+`[View.Auto<id>]` with `Match=Camera` (the file is created if needed; its other views and settings are kept, and a
+rotation the profile already has isn't added twice), and GyroUE uses it at once. Log:
+`probe: camera learned: <rotation> added to ... as view <id> '<label>' (Match=Camera)`.
+
+A probe started with `Probe=1` in a game that already has a profile adds its camera the same way. Only in a game with
+no profile does it still write the profile's default view (a restart applies it).
 
 ## Building from source
 

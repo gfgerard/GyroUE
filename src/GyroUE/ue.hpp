@@ -95,6 +95,9 @@ struct ProbeGroup {
 };
 std::vector<ProbeGroup> probe_groups();
 void probe_verdict(const std::string& id, int verdict, const std::string& note);
+// Forgets the snapshot, the candidates and the verdicts: a probe started again during play looks at the camera of
+// that moment only.
+void probe_reset();
 
 // Profile (INI text) from the scored diffs, "" until there are at least two. summary = one-line pick. A group
 // that moved the camera in the live test is picked first and the text says so (verified = true); otherwise the

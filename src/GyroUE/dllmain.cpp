@@ -24,6 +24,8 @@ LARGE_INTEGER g_freq{}, g_last_frame{};
 
 BOOL WINAPI hooked_peek(LPMSG msg, HWND hwnd, UINT min, UINT max, UINT remove) {
     const BOOL got = g_real_peek(msg, hwnd, min, max, remove);
+    if (got && msg && msg->message == WM_INPUT && GetCurrentThreadId() == g_game_thread)
+        gyroue::host_raw_input(reinterpret_cast<void*>(msg->lParam));
     if (!got && !g_in_frame && GetCurrentThreadId() == g_game_thread) {
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);

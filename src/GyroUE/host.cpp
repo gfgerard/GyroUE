@@ -1,5 +1,6 @@
 #include "host.hpp"
 
+#include "camera_match.hpp"
 #include "deps.hpp"
 #include "log.hpp"
 #include "longpress.hpp"
@@ -7,6 +8,7 @@
 #include "notify.hpp"
 #include "overlay.hpp"
 #include "perf.hpp"
+#include "profile.hpp"
 #include "ue.hpp"
 #include "xinput.hpp"
 
@@ -29,44 +31,6 @@
 
 namespace gyroue {
 namespace {
-
-// A gameplay view from the game profile. The default view (id 1) turns the PlayerController's
-// ControlRotation; other views add the deltas to a rotator property of the camera view target.
-// Any view can name another object (Object=Root.Sub..., Root = PC, Pawn, Camera or ViewTarget; each Sub is an
-// object property or a subobject name) and, for non-reflected C++ state, raw rotator offsets in it.
-struct View {
-    uint32_t id = 1;
-    std::string key = "Default", label = "Exploration";
-    std::string view_target_class;  // active when the view target's class chain has this class
-    std::string property;           // rotator property on the view object ("" = ControlRotation)
-    std::vector<std::string> object;  // path to the view object (empty = PC for the default view, else ViewTarget)
-    std::vector<int32_t> offsets;     // raw rotator offsets in the view object (instead of Property)
-    int32_t rotator_size = 24;        // 24 = double (UE5), 12 = float (UE4)
-    // WorldRotation=1: Property is a scene component's RelativeRotation with absolute rotation; its world rotation
-    // (ComponentToWorld) is written too, because the game turns the component from it (Severed Steel's camera).
-    bool world_rotation = false;
-    const char* world_why = nullptr;  // last reason it couldn't be applied (logged when it changes)
-    uint32_t parent = 0;            // settings inheritance
-    // Optional: scalar properties written whenever the gyro moves this view (e.g. to cancel a camera
-    // auto-recentering that the game only cancels for stick input). "Name:value" is on the view object;
-    // "Root.Sub.Name:value" on another object, with the same path syntax as Object= (Life is Strange:
-    // OnGyro=PC.@TP_Walk_Manual_C.SmoothedAutoManualRatio:1).
-    struct OnGyro {
-        std::vector<std::string> object;  // empty = the view object
-        std::string property;
-        double value = 0;
-        bool warned = false;
-    };
-    std::vector<OnGyro> on_gyro;
-    // Camera recenter (GyroLib's camera.recenter_button): Recenter=0 withdraws it in this view; RecenterPitch= is the
-    // level pitch in the view's own rotator (degrees, default 0).
-    bool recenter = true;
-    double recenter_pitch = 0;
-    // Diagnostics: log these properties whenever they change; Dump=1 logs all properties once.
-    std::vector<std::string> watch;
-    bool dump = false, dumped = false;
-    std::vector<std::string> watched_values;
-};
 
 // Sensitivity profiles (ADS, ALT_ADS, OTHER): extra GyroLib views (tabs in the panel, inheriting the default view's
 // settings) that replace the default view's settings while their button is held (Hold) or after it is pressed (Toggle).
@@ -93,13 +57,31 @@ uint32_t g_last_profile = 0;  // sensitivity profile reported last frame (0 = no
 
 std::wstring g_mod_dir, g_profile_path, g_exe_stem;
 std::wstring g_settings_path;  // GyroUE\GyroUE.ini (all games)
-// The game had a profile when it started; the probe writes the profile itself only if it didn't (and then keeps
-// updating the one it created this session), else <exe>.suggested.ini.
+// The game had a profile when it started; the probe started with Probe=1 writes the profile itself only if it didn't
+// (and then keeps updating the one it created this session), else it adds its camera as a view (see finish_tests).
 bool g_profile_existed = false, g_profile_created = false;
-std::vector<View> g_views;
+std::vector<View> g_views;           // read at start and again whenever the profile file changes
+FILETIME g_profile_time{};           // the profile's last write time when it was read
+std::vector<uint32_t> g_registered;  // view ids registered with GyroLib (tabs in the panel)
 // Diagnostics: [GyroUE] Probe=1 captures the camera state automatically on stick turns (see auto_probe) and
 // enables F7 (snapshot) / F8 (log what changed since the snapshot) for manual captures.
 bool g_probe = false, g_probe_snap_down = false, g_probe_diff_down = false;
+// The probe can also start during play, without Probe=1 or a restart: from ProbeKey, or by itself (AutoProbe=1) when the
+// camera stops following the gyro. Its verified camera is then added to the profile as a Match=Camera view.
+bool g_probe_runtime = false;       // the running probe was started during play
+bool g_probe_automatic = false;     // ... by AutoProbe (it gives up after a while without captures)
+bool g_auto_probe_setting = true;   // AutoProbe=
+int g_auto_probe_starts = 0;        // automatic starts this session (limited)
+ULONGLONG g_probe_started_at = 0, g_next_auto_probe = 0;
+struct Key {
+    int vk = 0;
+    bool ctrl = false, shift = false, alt = false;
+    std::string name;
+};
+Key g_probe_key;  // ProbeKey=
+bool g_probe_key_down = false;
+// Mouse look (Raw Input reaching the game's window): counts like the right stick for the probe and the camera checks.
+ULONGLONG g_mouse_moved_at = 0;
 
 std::optional<gyrolib::Context> g_gyro;
 std::optional<gyrolib::SdlInput> g_input;
@@ -191,67 +173,20 @@ void trace_frame(uint64_t now_ns, bool camera, uint32_t new_samples, const gl_ou
         log("trace: done (motion-trace.csv)");
     }
 }
-// The camera's POV is read every frame only while something needs it (the follow check until it has a verdict,
-// or the probe).
-bool g_need_pov = true;
-
-std::string ini(const wchar_t* section, const wchar_t* key, const wchar_t* fallback = L"") {
-    wchar_t buffer[2048];
-    GetPrivateProfileStringW(section, key, fallback, buffer, 2048, g_profile_path.c_str());
-    return narrow(buffer);
-}
-
-std::vector<std::string> split(const std::string& text, char sep) {
-    std::vector<std::string> out;
-    size_t start = 0;
-    while (start <= text.size()) {
-        size_t end = text.find(sep, start);
-        if (end == std::string::npos) end = text.size();
-        std::string item = text.substr(start, end - start);
-        while (!item.empty() && item.front() == ' ') item.erase(item.begin());
-        while (!item.empty() && item.back() == ' ') item.pop_back();
-        if (!item.empty()) out.push_back(item);
-        start = end + 1;
-    }
-    return out;
-}
-
-void load_view_extras(View& v, const wchar_t* section) {
-    v.object = split(ini(section, L"Object"), '.');
-    for (const std::string& o : split(ini(section, L"Offsets"), ','))
-        v.offsets.push_back(int32_t(std::strtol(o.c_str(), nullptr, 0)));
-    v.rotator_size = GetPrivateProfileIntW(section, L"RotatorSize", 24, g_profile_path.c_str());
-    v.world_rotation = GetPrivateProfileIntW(section, L"WorldRotation", 0, g_profile_path.c_str()) != 0;
-    v.watch = split(ini(section, L"Watch"), ',');
-    v.watched_values.assign(v.watch.size(), std::string{});
-    v.dump = GetPrivateProfileIntW(section, L"Dump", 0, g_profile_path.c_str()) != 0;
-    v.recenter = GetPrivateProfileIntW(section, L"Recenter", 1, g_profile_path.c_str()) != 0;
-    v.recenter_pitch = std::atof(ini(section, L"RecenterPitch", L"0").c_str());
-    for (const std::string& item : split(ini(section, L"OnGyro"), ',')) {
-        const size_t colon = item.find(':');
-        if (colon == std::string::npos) continue;
-        std::vector<std::string> path = split(item.substr(0, colon), '.');
-        if (path.empty()) continue;
-        View::OnGyro w;
-        w.property = path.back();
-        path.pop_back();
-        w.object = std::move(path);
-        w.value = std::atof(item.c_str() + colon + 1);
-        v.on_gyro.push_back(std::move(w));
-    }
-}
 
 std::string probe_header() {
     return "GyroUE " GYROUE_VERSION " camera probe (recreated every game session)\n"
            "\n"
            "How to use it (automatic):\n"
            "  1. In gameplay, stand still for a second. The gyro is paused while the probe captures.\n"
-           "  2. Turn the camera with the RIGHT STICK: more than 30 degrees sideways (and a bit up or down),\n"
-           "     then stop. GyroUE captures the turn by itself (turns without the stick, e.g. cutscenes, are ignored).\n"
+           "  2. Turn the camera with the RIGHT STICK or the MOUSE: more than 30 degrees sideways (and a bit up or\n"
+           "     down), then stop. GyroUE captures the turn by itself (turns without them, e.g. cutscenes, are ignored).\n"
            "  3. Repeat 3 or 4 times. From the second capture on, the game's profile is written to\n"
-           "     GyroUE\\profiles\\<game>.ini, or to <game>.suggested.ini if the game already had a profile\n"
-           "     (and copied at the end of this file). Once a camera is verified live, GyroUE sets Probe=0 in\n"
-           "     GyroUE\\GyroUE.ini by itself: restart the game and the gyro turns the camera.\n"
+           "     GyroUE\\profiles\\<game>.ini (and copied at the end of this file). Once a camera is verified live,\n"
+           "     GyroUE sets Probe=0 in GyroUE\\GyroUE.ini by itself: restart the game and the gyro turns the camera.\n"
+           "     If the game already had a profile, or the probe was started during play (ProbeKey, or AutoProbe when\n"
+           "     a camera stops following the gyro), the verified camera is added to the profile as a new view\n"
+           "     (Match=Camera) and used at once, without a restart.\n"
            "  Manual alternative: F7 = snapshot, turn with the stick, F8 = diff (pressing F7/F8 turns the automatic\n"
            "  capture off for the session).\n"
            "\n"
@@ -272,10 +207,17 @@ const char kDefaultSettings[] =
     "\r\n"
     "[GyroUE]\r\n"
     "; 1 = find the camera of a game whose camera ignores the gyro: in gameplay, turn the camera with the\r\n"
-    ";     RIGHT STICK (more than 30 degrees) and stop, 3-4 times (the gyro is paused meanwhile). GyroUE then writes the game's\r\n"
-    ";     profile (GyroUE\\profiles\\<game exe>.ini, or <game exe>.suggested.ini if the game already has one).\r\n"
+    ";     RIGHT STICK or MOUSE (more than 30 degrees) and stop, 3-4 times (the gyro is paused meanwhile). GyroUE then\r\n"
+    ";     writes the game's profile (GyroUE\\profiles\\<game exe>.ini; to one that exists, it adds the camera as a view).\r\n"
     ";     Once a camera is verified, GyroUE sets this back to 0 by itself. Results: GyroUE\\GyroUE-probe.log.\r\n"
     "Probe=0\r\n"
+    "; Learning a camera during the game, without restarting (results also in GyroUE\\GyroUE-probe.log):\r\n"
+    ";   ProbeKey: starts the probe right where you are, and cancels it. F1..F24, optionally with Ctrl+, Shift+ or Alt+;\r\n"
+    ";     empty = no key.\r\n"
+    ";   AutoProbe=1: when the camera stops following the gyro while you turn it yourself, the probe starts by itself.\r\n"
+    ";   A camera found this way is added to the game's profile as a new view and used at once. 0 = off.\r\n"
+    "ProbeKey=Ctrl+F7\r\n"
+    "AutoProbe=1\r\n"
     "; 0 = no on-screen notices (they still go to GyroUE.log).\r\n"
     "Notices=1\r\n"
     "\r\n"
@@ -336,6 +278,24 @@ std::string setting_text(const wchar_t* key, const wchar_t* fallback) {
         if (GetPrivateProfileStringW(L"GyroUE", key, L"\x01", value, 64, path->c_str()) && value[0] != L'\x01')
             return narrow(value);
     return narrow(fallback);
+}
+
+// A key setting: F1..F24, optionally after Ctrl+, Shift+ and/or Alt+ (case-insensitive). Empty or unknown = no key.
+Key parse_key(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return char(std::toupper(c)); });
+    Key k;
+    for (const std::string& part : split(text, '+')) {
+        if (part == "CTRL" || part == "CONTROL") k.ctrl = true;
+        else if (part == "SHIFT") k.shift = true;
+        else if (part == "ALT") k.alt = true;
+        else if (part.size() >= 2 && part[0] == 'F' && std::atoi(part.c_str() + 1) >= 1 && std::atoi(part.c_str() + 1) <= 24)
+            k.vk = VK_F1 + std::atoi(part.c_str() + 1) - 1;
+        else return {};
+    }
+    if (!k.vk) return {};
+    k.name = std::string(k.ctrl ? "Ctrl+" : "") + (k.shift ? "Shift+" : "") + (k.alt ? "Alt+" : "") + "F" +
+             std::to_string(k.vk - VK_F1 + 1);
+    return k;
 }
 
 // A profile button name: Xbox or PlayStation names (face buttons by position), case-insensitive. -1 = off/unknown.
@@ -420,79 +380,93 @@ uint32_t sensitivity_profile() {
 
 // The game's profile describes camera views (a profile can also hold only [GyroUE] settings, e.g. the DualSense
 // learning below): the probe then writes its result as a suggestion instead.
-bool profile_has_views() {
-    wchar_t buffer[64];
-    return GetPrivateProfileSectionW(L"View.Default", buffer, 64, g_profile_path.c_str()) > 0 ||
-           GetPrivateProfileStringW(L"GyroUE", L"Views", L"", buffer, 64, g_profile_path.c_str()) > 0;
+// GyroUE-probe.log, opened when the probe first runs this session (at start with Probe=1, or later from the probe key
+// or the automatic start).
+bool open_probe_log() {
+    static bool opened = false, tried = false;
+    if (tried) return opened;
+    tried = true;
+    const std::wstring probe_path = g_mod_dir + L"\\GyroUE-probe.log";
+    opened = probe_log_open(probe_path, probe_header());
+    log("probe: results in %s", opened ? narrow(probe_path).c_str() : "GyroUE.log (probe file failed)");
+    return opened;
+}
+
+FILETIME profile_stamp() {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    return GetFileAttributesExW(g_profile_path.c_str(), GetFileExInfoStandard, &data) ? data.ftLastWriteTime : FILETIME{};
 }
 
 void load_profile() {
-    View def;
-    def.label = ini(L"View.Default", L"Label", L"Exploration");
-    def.property = ini(L"View.Default", L"Property");
-    load_view_extras(def, L"View.Default");
-    g_views = {def};
     ensure_settings_file();
-    g_profile_existed = profile_has_views();
+    g_profile_existed = has_views(g_profile_path);
     g_probe = setting(L"Probe", 0) != 0;
+    g_auto_probe_setting = setting(L"AutoProbe", 1) != 0;
+    g_probe_key = parse_key(setting_text(L"ProbeKey", L"Ctrl+F7"));
     g_trace.wanted = setting(L"MotionTrace", 0) != 0;
     if (g_trace.wanted) log("settings: MotionTrace=1 (30 s from the first gameplay frame)");
     // On-screen notices (camera check, probe progress); Notices=0 keeps them in the log only.
     const bool notices = setting(L"Notices", 1) != 0;
-    log("settings: Probe=%d Notices=%d (GyroUE.ini, the game's profile overrides)", g_probe ? 1 : 0, notices ? 1 : 0);
+    log("settings: Probe=%d AutoProbe=%d ProbeKey=%s Notices=%d (GyroUE.ini, the game's profile overrides)", g_probe ? 1 : 0,
+        g_auto_probe_setting ? 1 : 0, g_probe_key.name.empty() ? "(none)" : g_probe_key.name.c_str(), notices ? 1 : 0);
     notify::set_enabled(notices);
     load_sensitivity_profiles();
     if (g_probe) {
-        const std::wstring probe_path = g_mod_dir + L"\\GyroUE-probe.log";
-        const bool opened = probe_log_open(probe_path, probe_header());
-        log("profile: probe enabled (automatic capture on stick turns, F7/F8 manual), results in %s", opened ? narrow(probe_path).c_str()
-                                                                                  : "GyroUE.log (probe file failed)");
+        open_probe_log();
+        log("profile: probe enabled (automatic capture on stick or mouse turns, F7/F8 manual)");
     }
-    if (GetFileAttributesW(g_profile_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        log("profile: %s not found, using the generic ControlRotation view only", narrow(g_profile_path).c_str());
-        return;
-    }
-    wchar_t list[512];
-    GetPrivateProfileStringW(L"GyroUE", L"Views", L"", list, 512, g_profile_path.c_str());
-    std::wstring all = list;
-    size_t start = 0;
-    while (start < all.size()) {
-        size_t end = all.find(L',', start);
-        if (end == std::wstring::npos) end = all.size();
-        std::wstring key = all.substr(start, end - start);
-        start = end + 1;
-        while (!key.empty() && key.front() == L' ') key.erase(key.begin());
-        while (!key.empty() && key.back() == L' ') key.pop_back();
-        if (key.empty()) continue;
-        const std::wstring section = L"View." + key;
-        View v;
-        v.key = narrow(key);
-        v.id = GetPrivateProfileIntW(section.c_str(), L"Id", 0, g_profile_path.c_str());
-        v.label = ini(section.c_str(), L"Label", key.c_str());
-        v.view_target_class = ini(section.c_str(), L"ViewTargetClass");
-        v.property = ini(section.c_str(), L"Property");
-        v.parent = GetPrivateProfileIntW(section.c_str(), L"Parent", 1, g_profile_path.c_str());
-        load_view_extras(v, section.c_str());
-        if (v.id <= 1 || v.view_target_class.empty() || (v.property.empty() && v.offsets.empty())) {
-            log("profile: view %s ignored (needs Id > 1, ViewTargetClass and Property or Offsets)", v.key.c_str());
+    g_views = load_views(g_profile_path);
+    g_profile_time = profile_stamp();
+}
+
+// Gives every profile view its GyroLib view (a tab in the panel, inheriting its parent's settings) and withdraws the
+// ones the profile no longer has: at start, and after the profile file changed during play.
+void register_views() {
+    gl_context* ctx = g_gyro->get();
+    for (const View& v : g_views) {
+        if (std::find(g_registered.begin(), g_registered.end(), v.id) != g_registered.end()) continue;
+        try {
+            g_gyro->register_view(v.id, v.label.c_str());
+        } catch (const std::exception& e) {
+            log("profile: view %u '%s' not registered with GyroLib: %s", v.id, v.label.c_str(), e.what());
             continue;
         }
-        g_views.push_back(v);
+        if (v.parent) gl_set_context_parent(ctx, v.id, v.parent);
+        g_registered.push_back(v.id);
     }
-    log("profile: %s, %zu view(s)", narrow(g_profile_path).c_str(), g_views.size());
-    for (const View& v : g_views) {
-        std::string object, where;
-        for (const std::string& part : v.object) object += (object.empty() ? "" : ".") + part;
-        for (int32_t off : v.offsets) where += (where.empty() ? "raw +0x" : ",0x") + std::format("{:X}", off);
-        if (where.empty()) where = v.property.empty() ? "ControlRotation" : v.property;
-        if (v.world_rotation) where += v.offsets.empty() ? " (WorldRotation)" : " (WorldRotation ignored: needs Property=)";
-        log("  view %u '%s' target=%s object=%s rotation=%s parent=%u", v.id, v.label.c_str(),
-            v.view_target_class.empty() ? "(pawn)" : v.view_target_class.c_str(),
-            object.empty() ? "(default)" : object.c_str(), where.c_str(), v.parent);
+    for (auto it = g_registered.begin(); it != g_registered.end();) {
+        const uint32_t id = *it;
+        if (id == 1 || std::any_of(g_views.begin(), g_views.end(), [&](const View& v) { return v.id == id; })) {
+            ++it;
+            continue;
+        }
+        gl_unregister_gameplay_context(ctx, id);
+        log("profile: view %u withdrawn (no longer in the profile)", id);
+        it = g_registered.erase(it);
     }
-    for (const View& v : g_views)
-        if (!v.on_gyro.empty() || !v.watch.empty() || v.dump)
-            log("  view %u extras: %zu OnGyro write(s), %zu watch(es), dump=%d", v.id, v.on_gyro.size(), v.watch.size(), v.dump);
+}
+
+// The profile file changed (edited by hand, or a view added by the probe): read its views again and use them at once.
+void check_profile_file() {
+    static ULONGLONG next = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now < next) return;
+    next = now + 1000;
+    const FILETIME stamp = profile_stamp();
+    if (CompareFileTime(&stamp, &g_profile_time) == 0) return;
+    g_profile_time = stamp;
+    log("profile: the profile file changed, views read again");
+    g_views = load_views(g_profile_path);
+    // A new view can't take a sensitivity profile's id once that profile has its tab (at start the view wins).
+    std::erase_if(g_views, [](const View& v) {
+        const bool taken = std::any_of(std::begin(g_profiles), std::end(g_profiles),
+                                       [&](const Profile& p) { return p.id == v.id && p.registered; });
+        if (taken) log("profile: view %s ignored, Id=%u belongs to a sensitivity profile", v.key.c_str(), v.id);
+        return taken;
+    });
+    register_views();
+    g_last_view = UINT32_MAX;  // log the active view again
+    g_recenter_view = 0;       // decide recenter support again
 }
 
 bool start_gyro() {
@@ -505,9 +479,7 @@ bool start_gyro() {
     log("gyro: GyroLib ABI %u (built against SDK %s)", gl_abi_version(), GL_VERSION_STRING);
     g_gyro.emplace();
     gl_context* ctx = g_gyro->get();
-    for (const View& v : g_views) g_gyro->register_view(v.id, v.label.c_str());
-    for (const View& v : g_views)
-        if (v.parent) gl_set_context_parent(ctx, v.id, v.parent);
+    register_views();
     // Every profile gets its tab, so the player sees it exists; a disabled one says how to enable it.
     for (Profile& p : g_profiles) {
         if (std::any_of(g_views.begin(), g_views.end(), [&](const View& v) { return v.id == p.id; })) {
@@ -613,7 +585,8 @@ Scene read_scene() {
 
     const ue::Obj camera = ue::read_obj(s.pc, "PlayerCameraManager");
     s.camera = camera;
-    s.pov_ok = (g_need_pov || g_probe) && ue::camera_pov(camera, s.pov_pitch, s.pov_yaw);
+    // Read every frame: the follow check keeps watching after its verdict (offsets cached, a few guarded reads).
+    s.pov_ok = ue::camera_pov(camera, s.pov_pitch, s.pov_yaw);
     s.loc_ok = g_probe && s.pov_ok && ue::camera_pov_location(camera, s.pov_loc);
     const ue::Prop view_target = ue::prop_of(camera, "ViewTarget");
     const ue::Prop target = ue::find_prop(ue::struct_type(view_target), "Target");
@@ -627,14 +600,36 @@ Scene read_scene() {
     return s;
 }
 
-View* active_view(const Scene& s) {
+View* find_view(uint32_t id) {
+    for (View& v : g_views)
+        if (v.id == id) return &v;
+    return nullptr;
+}
+
+// The view for the camera's view target: a ViewTargetClass view (not Match=Camera), else the default one.
+View* base_view(const Scene& s) {
     if (s.view_target) {
         for (View& v : g_views)
-            if (!v.view_target_class.empty() && ue::is_a(s.view_target, v.view_target_class.c_str())) return &v;
+            if (!v.match_camera && !v.view_target_class.empty() && ue::is_a(s.view_target, v.view_target_class.c_str()))
+                return &v;
     }
     // Main menus usually possess a placeholder DefaultPawn (SpectatorPawn derives from it): no gameplay camera.
     if (!s.pawn || ue::is_a(s.pawn, "DefaultPawn")) return nullptr;
     return &g_views.front();
+}
+
+CameraMatch g_match;
+
+// The view the gyro turns: the base view, or the Match=Camera view for the same view target that the camera follows
+// now (camera_match.hpp).
+View* active_view(const Scene& s, View* base) {
+    if (!base) return nullptr;
+    std::vector<uint32_t> members = {base->id};
+    for (const View& v : g_views)
+        if (v.match_camera && (v.view_target_class.empty() || ue::is_a(s.view_target, v.view_target_class.c_str())))
+            members.push_back(v.id);
+    View* view = find_view(g_match.select(members));
+    return view ? view : base;
 }
 
 // Subobject lookups need a full object scan: cache them and re-check the cached object cheaply.
@@ -771,6 +766,11 @@ void update_recenter_support(const View* view, const Scene& s) {
     if (supported != g_recenter_supported)
         gl_set_recenter_step_callback(g_gyro->get(), supported ? &on_recenter_step : nullptr, nullptr);
     g_recenter_supported = supported;
+    // Match=Camera views take turns with their base view: each view's support is logged once, then only changes.
+    static std::vector<std::pair<uint32_t, bool>> logged;
+    const std::pair<uint32_t, bool> entry{view->id, supported};
+    if (std::find(logged.begin(), logged.end(), entry) != logged.end()) return;
+    logged.push_back(entry);
     if (supported) log("recenter: available in view %u '%s' (level pitch %.1f)", view->id, view->label.c_str(), view->recenter_pitch);
     else log("recenter: unavailable in view %u '%s' (%s)", view->id, view->label.c_str(),
              view->recenter ? "its rotation can't be read yet" : "Recenter=0 in the profile");
@@ -821,13 +821,19 @@ void learn_dualsense() {
 
 enum class Written { Nothing, Profile, Suggested };
 
+// The probe's verified camera becomes a new Match=Camera view in the existing (or new) profile, rather than the
+// profile's default view: when it was started during play (that camera is an extra one, the default view works
+// elsewhere), or when the game already has a profile (never overwritten).
+bool probe_adds_view() { return g_probe_runtime || g_profile_existed; }
+
 Written write_suggestion(bool& usable, bool& verified) {
     usable = verified = false;
     std::string summary;
     const std::string probe = ue::probe_suggestion(narrow(g_exe_stem), summary, false, verified);
     if (probe.empty()) return Written::Nothing;
     usable = probe.find("[View.Default]") != std::string::npos;
-    const bool as_profile = usable && verified && (!g_profile_existed || g_profile_created);
+    // A probe started during play, or in a game that already has a profile, adds its camera as a view instead.
+    const bool as_profile = usable && verified && !probe_adds_view() && (!g_profile_existed || g_profile_created);
     const std::string text = as_profile ? ue::probe_suggestion(narrow(g_exe_stem), summary, true, verified) : probe;
     const std::wstring path = g_mod_dir + L"\\profiles\\" + g_exe_stem + (as_profile ? L".ini" : L".suggested.ini");
     // The profile's [GyroUE] settings (e.g. DualSenseAsDualShock4, learned earlier) survive the probe rewriting it.
@@ -914,10 +920,6 @@ double orbit_radius() {
     return r[r.size() / 2];
 }
 
-// While the automatic probe runs, the gyro output is paused: a turn must come from the right stick alone, and the
-// gyro written into a rotation the camera ignores (or a resting controller's drift) would only spoil it.
-bool probe_capturing() { return g_probe && g_auto.enabled && !g_auto.done; }
-
 // The right stick is deflected (GyroLib's view of the selected controller, SDL or a bound companion).
 bool right_stick_moving() {
     gl_flick_input fi{};
@@ -925,6 +927,11 @@ bool right_stick_moving() {
     g_auto.stick_data = true;
     return std::hypot(fi.stick_x, fi.stick_y) > 0.3f;
 }
+
+bool mouse_moving() { return GetTickCount64() - g_mouse_moved_at < 150; }
+
+// The player turns the camera themselves: right stick or mouse.
+bool look_input() { return right_stick_moving() || mouse_moving(); }
 
 struct LiveTest {
     enum Phase { Off, Settle, Null, YawOut, YawBack, PitchOut, PitchBack } phase = Off;
@@ -942,6 +949,14 @@ struct LiveTest {
     bool yaw_ok = false, pitch_ok = false, turns_pawn = false;
     ULONGLONG phase_at = 0, ok_since = 0, last_pause_notice = 0;
 } g_test;
+
+// While the automatic probe runs, the gyro output is paused: a turn must come from the right stick alone, and the
+// gyro written into a rotation the camera ignores (or a resting controller's drift) would only spoil it.
+// An automatic probe (AutoProbe) keeps the gyro on until its live test: the camera ignores it anyway, a turn without the
+// stick or mouse isn't captured, and the follow check must see it when the camera follows the gyro again.
+bool probe_capturing() {
+    return g_probe && g_auto.enabled && !g_auto.done && (!g_probe_automatic || g_test.phase != LiveTest::Off);
+}
 
 View test_view(const ue::ProbeGroup& g) {
     View v;
@@ -1081,8 +1096,72 @@ bool disable_probe() {
     return ok;
 }
 
+// The probe is over for this session (until the probe key or AutoProbe starts it again).
+void probe_end(const char* why) {
+    if (!g_probe) return;
+    g_probe = false;
+    g_test.phase = LiveTest::Off;
+    g_probe_runtime = g_probe_automatic = false;
+    g_next_auto_probe = GetTickCount64() + 30000;
+    log("probe: stopped (%s)", why);
+    probe_log("probe: stopped (%s)", why);
+}
+
+// A probe started during play (or in a game with a profile) verified a camera: it becomes a Match=Camera view of the
+// profile, used at once (check_profile_file reads the file again). The profile's other views and settings are kept.
+void learn_camera(const ue::ProbeGroup& g) {
+    LearnedView learned;
+    learned.object = g.object;
+    learned.property = g.property;
+    learned.offsets = g.offsets;
+    learned.rotator_size = g.size ? g.size : 24;
+    learned.world_rotation = g.world;
+    learned.label = g.cls.empty() ? "Learned camera" : g.cls;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    learned.note = std::format("Learned by the GyroUE {} camera probe on {:04}-{:02}-{:02} {:02}:{:02} (view target {}).\n"
+                               "Live test: {}. Used while the camera follows it (Match=Camera).",
+                               GYROUE_VERSION, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute,
+                               ue::name_of(g_auto.target_class), g.note.empty() ? "moved the camera" : g.note);
+    std::vector<uint32_t> reserved;
+    for (const Profile& p : g_profiles) reserved.push_back(p.id);
+    uint32_t id = 0;
+    std::string key;
+    const AddResult r = add_view(g_profile_path, narrow(g_exe_stem), learned, reserved, id, key);
+    const std::string rotation =
+        g.object + (g.property.empty() ? std::format(" raw x{}", g.offsets.size()) : "." + g.property);
+    if (r == AddResult::Added) {
+        log("probe: camera learned: %s added to %s as view %u '%s' (Match=Camera)", rotation.c_str(),
+            narrow(g_profile_path).c_str(), id, learned.label.c_str());
+        probe_log("probe: camera learned: %s added to the profile as [View.%s] (Id=%u, Match=Camera)", rotation.c_str(),
+                  key.c_str(), id);
+        notify::show(L"GyroUE: camera found and VERIFIED, added to this game's profile.\nThe gyro turns it from now on "
+                     L"(no restart needed); the other cameras keep working.", 20);
+        g_profile_time = {};  // read the profile again on the next check
+    } else if (r == AddResult::Duplicate) {
+        log("probe: camera learned: %s is already view %u of the profile", rotation.c_str(), id);
+        notify::show(L"GyroUE: camera found and VERIFIED; the profile already has it.\nThe gyro switches to it when "
+                     L"the camera follows it.", 15);
+    } else {
+        log("probe: camera learned (%s) but %s couldn't be written", rotation.c_str(), narrow(g_profile_path).c_str());
+        notify::show(L"GyroUE: camera found, but the game's profile couldn't be written.\nSee GyroUE\\GyroUE.log.", 15);
+    }
+    g_auto.done = true;
+    if (!g_probe_runtime) disable_probe();
+    probe_end("camera learned");
+}
+
 void finish_tests() {
     g_test.phase = LiveTest::Off;
+    if (probe_adds_view()) {
+        const std::vector<ue::ProbeGroup> groups = ue::probe_groups();
+        const auto verified = std::find_if(groups.begin(), groups.end(),
+                                           [](const ue::ProbeGroup& g) { return g.verdict == ue::kMovesCamera; });
+        if (verified != groups.end()) {
+            log("probe: done, a rotation moved the camera in both rounds of the live test");
+            return learn_camera(*verified);
+        }
+    }
     bool usable = false, verified = false;
     const Written written = write_suggestion(usable, verified);
     const std::wstring file = L"GyroUE\\profiles\\" + g_exe_stem + (written == Written::Profile ? L".ini" : L".suggested.ini");
@@ -1107,10 +1186,11 @@ void finish_tests() {
                          (usable ? L"An unverified guess is in " + file + L" (it will probably not work).\n" : std::wstring()) +
                          L"See GyroUE\\GyroUE-probe.log. The gyro works again (default camera).",
                      30);
+        if (g_probe_runtime) probe_end("no rotation moved the camera");
         return;
     }
     notify::show(L"GyroUE probe: none of these rotations moved the camera.\nTurn the camera again with the RIGHT "
-                 L"STICK (more than 30°), then stop, to find more.",
+                 L"STICK or the MOUSE (more than 30°), then stop, to find more.",
                  15);
 }
 
@@ -1118,13 +1198,13 @@ void finish_tests() {
 void run_live_test(const Scene& s, bool valid, ULONGLONG still_for) {
     const ULONGLONG now = GetTickCount64();
     const bool writing = g_test.phase != LiveTest::Settle && g_test.phase != LiveTest::Null;
-    if (!valid || !s.pov_ok || ue::class_of(s.view_target) != g_auto.target_class || right_stick_moving()) {
+    if (!valid || !s.pov_ok || ue::class_of(s.view_target) != g_auto.target_class || look_input()) {
         if (writing || g_test.phase == LiveTest::Null)
             abort_test(s, !valid ? "left gameplay" : !s.pov_ok ? "no camera" : ue::class_of(s.view_target) != g_auto.target_class
                                                                                   ? "another camera" : "stick moved");
         return;
     }
-    const double dy = wrap180(s.pov_yaw - g_test.base_y), dp = s.pov_pitch - g_test.base_p;
+    const double dy = wrap180(s.pov_yaw - g_test.base_y), dp = wrap180(s.pov_pitch - g_test.base_p);
     // A condition held for `ms` (the camera may ease into a written turn).
     auto held = [&](bool on, ULONGLONG ms) {
         if (!on) return g_test.ok_since = 0, false;
@@ -1232,7 +1312,7 @@ void auto_probe(const Scene& s) {
     const bool valid = s.pov_ok && s.pawn && !s.paused && !s.cursor && game_has_focus();
     if (valid) {
         const double motion = g_auto.have_last ? std::abs(wrap180(s.pov_yaw - g_auto.last_yaw)) +
-                                                     std::abs(s.pov_pitch - g_auto.last_pitch)
+                                                     std::abs(wrap180(s.pov_pitch - g_auto.last_pitch))
                                                : 1;
         if (motion > 0.05 || !g_auto.have_last) g_auto.still_since = now;
         g_auto.last_pitch = s.pov_pitch, g_auto.last_yaw = s.pov_yaw, g_auto.have_last = true;
@@ -1247,18 +1327,19 @@ void auto_probe(const Scene& s) {
     }
 
     if (g_auto.armed) {
-        if (right_stick_moving()) g_auto.stick_turn = true;
+        if (look_input()) g_auto.stick_turn = true;
         if (s.pawn != g_auto.pawn || now - g_auto.snapshot_at > 120000) {  // other pawn, or stale
             g_auto.armed = false;
             return;
         }
-        const double dy = std::abs(wrap180(s.pov_yaw - g_auto.snap_yaw)), dp = std::abs(s.pov_pitch - g_auto.snap_pitch);
+        // UE5 keeps pitch as 0..360 (350 = 10 degrees down): both deltas wrap.
+        const double dy = std::abs(wrap180(s.pov_yaw - g_auto.snap_yaw)), dp = std::abs(wrap180(s.pov_pitch - g_auto.snap_pitch));
         if (still_for < 300 || dy < 30) return;  // still turning, or not far enough yet
         g_auto.armed = false;
         g_auto.next_snapshot = now + 1500;
         // The camera turned without the right stick: a cutscene or a scripted camera, not the player's look input.
         if (g_auto.stick_data && !g_auto.stick_turn) {
-            probe_log("probe: turn of %.0f degrees ignored: the right stick wasn't used (cutscene or scripted camera)", dy);
+            probe_log("probe: turn of %.0f degrees ignored: neither the right stick nor the mouse was used (cutscene or scripted camera)", dy);
             return;
         }
         ++g_auto.captures;
@@ -1280,11 +1361,11 @@ void auto_probe(const Scene& s) {
         if (g_auto.captures >= kCapturesForTest && start_tests()) return;
         if (g_auto.captures >= kMaxAutoCaptures) return finish_tests();
         notify::show(g_auto.captures < kCapturesForTest
-                         ? std::format(L"GyroUE probe: capture {} of {} done.\nTurn the camera again with the RIGHT STICK "
+                         ? std::format(L"GyroUE probe: capture {} of {} done.\nTurn the camera again with the RIGHT STICK or MOUSE "
                                        L"(more than 30°, also up or down), then stop.",
                                        g_auto.captures, kCapturesForTest)
                          : std::format(L"GyroUE probe: capture {} done, no new rotation to test yet.\nTurn the camera again "
-                                       L"with the RIGHT STICK (more than 30°), then stop.",
+                                       L"with the RIGHT STICK or MOUSE (more than 30°), then stop.",
                                        g_auto.captures),
                      10);
         return;
@@ -1300,10 +1381,10 @@ void auto_probe(const Scene& s) {
         g_auto.snapshot_at = now;
         if (!g_auto.announced) {
             g_auto.announced = true;
-            log("probe: automatic capture ready: turn the camera with the RIGHT STICK (more than 30 degrees), stop, "
+            log("probe: automatic capture ready: turn the camera with the RIGHT STICK or the MOUSE (more than 30 degrees), stop, "
                 "and repeat; after %d captures the rotations found are tested live; the gyro is paused meanwhile",
                 kCapturesForTest);
-            notify::show(L"GyroUE probe ready to find the camera. In game, turn the camera with the RIGHT STICK "
+            notify::show(L"GyroUE probe ready to find the camera. In game, turn the camera with the RIGHT STICK or MOUSE "
                          L"(more than 30°), then stop. Repeat 3 times.\nThen don't touch the controller while "
                          L"the probe tests what it found.",
                          30);
@@ -1311,10 +1392,13 @@ void auto_probe(const Scene& s) {
     }
 }
 
+bool key_held(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
 void probe_keys(const Scene& s) {
-    const bool focused = game_has_focus();
-    const bool snap = focused && (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
-    const bool diff = focused && (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    // Plain F7/F8 only: with Ctrl, Shift or Alt they may be the probe key (Ctrl+F7 by default).
+    const bool plain = game_has_focus() && !key_held(VK_CONTROL) && !key_held(VK_SHIFT) && !key_held(VK_MENU);
+    const bool snap = plain && key_held(VK_F7);
+    const bool diff = plain && key_held(VK_F8);
     if ((snap || diff) && g_auto.enabled) {
         g_auto.enabled = g_auto.armed = false;
         undo_turn(s);
@@ -1327,13 +1411,82 @@ void probe_keys(const Scene& s) {
     g_probe_diff_down = diff;
 }
 
+// Starts the probe during play, for the camera of that moment: from the probe key, or by itself (AutoProbe) when the
+// camera stopped following the gyro. Earlier captures and verdicts are forgotten.
+void probe_start(bool automatic) {
+    if (g_probe) return;
+    open_probe_log();
+    ue::probe_reset();
+    const ULONGLONG keep_notice = g_test.last_pause_notice;
+    g_auto = {};
+    g_test = {};
+    g_test.last_pause_notice = keep_notice;
+    g_probe = true;
+    g_probe_runtime = true;
+    g_probe_automatic = automatic;
+    g_probe_started_at = GetTickCount64();
+    const char* why = automatic ? "AutoProbe: the camera stopped following the gyro" : "probe key";
+    log("probe: started during play (%s)", why);
+    probe_log("probe: started during play (%s)", why);
+    if (automatic) {
+        g_auto.announced = true;  // this notice replaces the usual "probe ready" one
+        const std::wstring cancel = g_probe_key.name.empty()
+                                        ? std::wstring()
+                                        : L" " + std::wstring(g_probe_key.name.begin(), g_probe_key.name.end()) + L" cancels.";
+        notify::show(L"GyroUE: this camera ignores the gyro. To teach it to GyroUE, turn the camera with the RIGHT STICK or "
+                     L"MOUSE (more than 30°), then stop. Repeat 3 times.\nThen don't touch the controller for a few "
+                     L"seconds." + cancel,
+                     20);
+    }
+}
+
+// Probe key: starts the probe during play, or cancels any probe (also one started with Probe=1, for this session).
+void probe_hotkey(const Scene& s) {
+    const Key& k = g_probe_key;
+    const bool down = k.vk && game_has_focus() && key_held(k.vk) && k.ctrl == key_held(VK_CONTROL) &&
+                      k.shift == key_held(VK_SHIFT) && k.alt == key_held(VK_MENU);
+    if (down && !g_probe_key_down) {
+        if (!g_probe) {
+            probe_start(false);
+        } else {
+            undo_turn(s);
+            probe_end("probe key");
+            notify::show(L"GyroUE probe cancelled.", 5);
+        }
+    }
+    g_probe_key_down = down;
+}
+
+// AutoProbe: an automatic probe that hasn't captured a turn for a while gives up (the camera may be a cutscene's),
+// and so does one whose camera follows the gyro again before its live test.
+void auto_probe_watch() {
+    if (!g_probe || !g_probe_automatic || g_test.phase != LiveTest::Off) return;
+    const ULONGLONG now = GetTickCount64();
+    if (g_auto.captures == 0 && now - g_probe_started_at > 45000) {
+        probe_end("AutoProbe: no camera turn with the stick or mouse in 45 s");
+        notify::show(L"GyroUE: stopped looking for the camera (no turn with the stick or mouse).", 6);
+    }
+}
+
+// Returns whether the probe started.
+bool request_auto_probe() {
+    if (!g_auto_probe_setting || g_probe || g_auto_probe_starts >= 3 || GetTickCount64() < g_next_auto_probe) return false;
+    ++g_auto_probe_starts;
+    probe_start(true);
+    return true;
+}
+
 // Step 1 of finding a camera: tells the user when the gyro turns the view's rotation but the camera doesn't
 // follow (the game ignores ControlRotation, or the profile's rotation), or confirms that it does. Only on the
 // player's own camera (see player_camera): scripted or fixed cameras ignore every rotation by design.
+// After the verdict the check keeps running, only to log when the camera stops or starts following again (a
+// camera switch inside the same view target, e.g. a game action that takes over the camera).
 struct FollowCheck {
     double applied = 0, moved = 0, last_pitch = 0, last_yaw = 0, total_applied = 0, total_moved = 0;
     bool have_last = false, warned = false, confirmed = false;
     int ignored = 0, followed = 0;  // 2 s windows with enough gyro motion where the camera ignored / followed it
+    int ignored_in_a_row = 0;       // ... ignored since the last followed window
+    bool lost = false;              // after "confirmed": the camera stopped following (logged)
     bool stick = false;             // the right stick moved in this window: the camera motion can't be judged
     ULONGLONG window_end = 0;
     // Some games' gameplay camera is its own actor, not the pawn (Hogwarts Legacy: BP_ThirdPersonCameraStackActor_C).
@@ -1351,44 +1504,80 @@ bool player_camera(const Scene& s, double moved) {
     if (std::find(g_follow.player_cameras.begin(), g_follow.player_cameras.end(), cls) != g_follow.player_cameras.end())
         return true;
     if (cls != g_follow.stick_class) g_follow.stick_class = cls, g_follow.stick_moved = 0;
-    if (right_stick_moving()) g_follow.stick_moved += moved;
+    if (look_input()) g_follow.stick_moved += moved;
     if (g_follow.stick_moved < 30) return false;
     g_follow.player_cameras.push_back(cls);
     log("camera: view target %s turns with the right stick: treated as the player's camera", ue::name_of(cls).c_str());
     return true;
 }
 
-void follow_check(const Scene& s, const View* view, double gyro_deg) {
-    if (g_follow.warned || g_follow.confirmed) return;  // verdict given: off for the session
+// Which camera the player sees, for the follow check's log lines.
+std::string camera_description(const Scene& s) {
+    std::string text = std::format("target {}, camera manager {}", ue::name_of(ue::class_of(s.view_target)),
+                                   ue::name_of(ue::class_of(s.camera)));
+    const std::string style = ue::value_string(s.camera, "CameraStyle");
+    if (!style.empty()) text += ", CameraStyle " + style;
+    return text;
+}
+
+// gyro_yaw: the gyro's yaw written this frame (degrees, absolute). The windows judge yaw only: at the pitch limit
+// (looking straight up or down) the camera ignores pitch writes, which isn't the game ignoring the gyro.
+void follow_check(const Scene& s, const View* view, double gyro_yaw) {
     if (!s.pov_ok) {
         g_follow.have_last = false;
         return;
     }
-    const double moved = g_follow.have_last ? std::abs(wrap180(s.pov_yaw - g_follow.last_yaw)) +
-                                                  std::abs(s.pov_pitch - g_follow.last_pitch)
-                                            : 0;
+    const double moved_yaw = g_follow.have_last ? std::abs(wrap180(s.pov_yaw - g_follow.last_yaw)) : 0;
+    const double moved = g_follow.have_last ? moved_yaw + std::abs(wrap180(s.pov_pitch - g_follow.last_pitch)) : 0;
     g_follow.last_pitch = s.pov_pitch, g_follow.last_yaw = s.pov_yaw, g_follow.have_last = true;
     if (!view || s.paused || s.cursor || !s.pawn) return;
     if (view->view_target_class.empty() && !player_camera(s, moved)) return;
-    if (gyro_deg <= 0) return;
-    g_follow.applied += gyro_deg;
-    g_follow.moved += moved;
-    if (right_stick_moving()) g_follow.stick = true;
+    if (gyro_yaw <= 0) return;
+    g_follow.applied += gyro_yaw;
+    g_follow.moved += moved_yaw;
+    if (look_input()) g_follow.stick = true;
     const ULONGLONG now = GetTickCount64();
     if (!g_follow.window_end) g_follow.window_end = now + 2000;
     if (now < g_follow.window_end) return;
-    if (g_follow.applied >= 10 && !g_follow.stick) {  // enough gyro motion in this window to judge, no stick
+    int verdict = 0;  // this window: -1 ignored, 1 followed, 0 unclear or not judged
+    const bool judged = g_follow.applied >= 10 && !g_follow.stick;
+    if (judged) {  // enough gyro motion in this window to judge, no stick
         const double ratio = g_follow.moved / g_follow.applied;
-        if (ratio < 0.2) ++g_follow.ignored;
-        else if (ratio > 0.5) ++g_follow.followed;
-        g_follow.total_applied += g_follow.applied;
-        g_follow.total_moved += g_follow.moved;
+        if (ratio < 0.2) verdict = -1;
+        else if (ratio > 0.5) verdict = 1;
     }
+    const double window_applied = g_follow.applied, window_moved = g_follow.moved;
     g_follow.applied = g_follow.moved = 0;
     g_follow.window_end = 0;
     g_follow.stick = false;
     std::string rotation = view->property.empty() ? "ControlRotation" : view->property;
     if (!view->offsets.empty()) rotation = "the profile's raw offsets";
+    if (verdict == -1) ++g_follow.ignored_in_a_row;
+    if (verdict == 1) g_follow.ignored_in_a_row = 0;
+    if (g_follow.warned || g_follow.confirmed) {  // verdict given: only log changes from here on
+        // Three ignored windows in a row (about 6 s of gyro), as for the first verdict: one or two can be the pitch
+        // limit, a camera blend, a short scripted moment or a hitch. Two gave a false AutoProbe start in PAYDAY 3
+        // (an action that held the camera for ~4 s).
+        if (g_follow.confirmed && !g_follow.lost && g_follow.ignored_in_a_row >= 3) {
+            g_follow.lost = true;
+            log("camera: stopped following the gyro (%s, view '%s'; last window: gyro %.0f degrees, camera %.0f) - %s",
+                rotation.c_str(), view->label.c_str(), window_applied, window_moved, camera_description(s).c_str());
+            request_auto_probe();
+        } else if (verdict == 1 && (g_follow.lost || (g_follow.warned && !g_follow.confirmed))) {
+            g_follow.lost = false;
+            g_follow.confirmed = true;
+            log("camera: follows the gyro again (%s, view '%s') - %s", rotation.c_str(), view->label.c_str(),
+                camera_description(s).c_str());
+            if (g_probe_automatic && g_test.phase == LiveTest::Off) probe_end("AutoProbe: the camera follows the gyro again");
+        }
+        return;
+    }
+    if (verdict == -1) ++g_follow.ignored;
+    if (verdict == 1) ++g_follow.followed;
+    if (judged) {
+        g_follow.total_applied += window_applied;
+        g_follow.total_moved += window_moved;
+    }
     if (!g_follow.warned && g_follow.ignored >= 3 && g_follow.followed == 0) {
         g_follow.warned = true;
         log("camera: the gyro turned %s (view '%s') by %.0f degrees but the camera moved only %.0f: the game ignores it. "
@@ -1397,19 +1586,77 @@ void follow_check(const Scene& s, const View* view, double gyro_deg) {
             rotation.c_str(), view->label.c_str(), g_follow.total_applied, g_follow.total_moved, narrow(g_settings_path).c_str());
         if (g_probe)
             notify::show(L"GyroUE: the gyro doesn't move this camera yet.\nThe probe is on: turn the camera with the "
-                         L"right stick to find the right rotation.", 12);
+                         L"right stick or mouse to find the right rotation.", 12);
+        else if (request_auto_probe())
+            ;  // AutoProbe started: its own notice says what to do
         else if (view->offsets.empty() && view->property.empty())
             notify::show(L"GyroUE: this game's camera seems to ignore the gyro.\nTo find it, set Probe=1 in GyroUE\\GyroUE.ini, "
                          L"restart the game. Ignore this if it's actually working.", 15);
         else
             notify::show(L"GyroUE: the camera doesn't follow the profile's rotation.\nThe profile may be outdated: "
                          L"set Probe=1 in GyroUE\\GyroUE.ini to find the camera again.", 15);
-        g_need_pov = false;
     }
     if (!g_follow.confirmed && g_follow.followed >= 3) {
         g_follow.confirmed = true;
-        log("camera: confirmed, the camera follows the gyro (%s, view '%s')", rotation.c_str(), view->label.c_str());
-        g_need_pov = false;
+        log("camera: confirmed, the camera follows the gyro (%s, view '%s') - %s", rotation.c_str(), view->label.c_str(),
+            camera_description(s).c_str());
+    }
+}
+
+// The fast path of the Match=Camera choice reads the current view's rotation back: its yaw before and after this
+// frame's gyro write, to see on the next frame whether the game put it back.
+struct WriteBack {
+    uint32_t view = 0;  // 0 = nothing written last frame
+    double before = 0, after = 0, written = 0;
+} g_write_back;
+
+// One frame of the Match=Camera choice (camera_match.hpp). On a switch, the gyro the dropped view lost is written into
+// the new one at once, so the camera catches up instead of losing the turn. Logs each switch with its reason (up to
+// 200 per session: a cutscene ignores every view and would repeat them) and every view that follows after a switch.
+void camera_match_frame(const Scene& s, const View* view, double yaw, double pitch, bool write_failed, int rewritten) {
+    static bool have_last = false, all_ignored = false;
+    static double last_yaw = 0;
+    static int switches_logged = 0;
+    // Yaw only: at the pitch limit the camera ignores pitch whatever view turns it (camera_match.hpp).
+    double moved = 0;
+    if (s.pov_ok && have_last) moved = std::abs(wrap180(s.pov_yaw - last_yaw));
+    if (s.pov_ok) last_yaw = s.pov_yaw;
+    have_last = s.pov_ok;
+    if (!view || !s.pov_ok || s.paused || s.cursor) return;
+    auto label = [](uint32_t id) {
+        const View* v = find_view(id);
+        return v ? v->label : std::string("?");
+    };
+    CameraMatch::Frame f;
+    f.yaw = yaw, f.pitch = pitch, f.moved = moved, f.look = look_input(), f.write_failed = write_failed;
+    f.rewritten = rewritten;
+    switch (g_match.frame(f, GetTickCount64())) {
+    case CameraMatch::Switched: {
+        g_write_back = {};
+        View* next = find_view(g_match.current());
+        const double cy = g_match.carry_yaw(), cp = g_match.carry_pitch();
+        const bool carried = next && (cy != 0 || cp != 0) && apply(*next, s, cp, cy);
+        if (carried) g_applied_yaw += cy, g_applied_pitch += cp, g_applied_this_frame = true;
+        const char* why = g_match.reason() == CameraMatch::Rewritten ? "is rewritten by the game"
+                        : g_match.reason() == CameraMatch::Missing   ? "can't be written (object not found)"
+                                                                     : "is ignored by the camera";
+        if (++switches_logged <= 200)
+            log("camera: '%s' %s, trying '%s' (%.1f degrees carried over)", label(g_match.previous()).c_str(), why,
+                label(g_match.current()).c_str(), carried ? std::abs(cy) + std::abs(cp) : 0.0);
+        break;
+    }
+    case CameraMatch::Follows:
+        all_ignored = false;
+        log("camera: the camera follows view '%s' now (Match=Camera) - %s", label(g_match.current()).c_str(),
+            camera_description(s).c_str());
+        break;
+    case CameraMatch::AllIgnored:
+        g_write_back = {};
+        if (!all_ignored) log("camera: no view of this camera follows the gyro (cutscene, or a camera to learn) - %s",
+                              camera_description(s).c_str());
+        all_ignored = true;
+        break;
+    case CameraMatch::None: break;
     }
 }
 
@@ -1482,12 +1729,68 @@ bool panel_has_pad(gl_context* ctx, SDL_Gamepad* pad) {
     return held = busy;
 }
 
+// A state logged when it changes and the new value has held for a while, so a hold-to-aim button or a pad being
+// picked up doesn't flood the log. The first value is logged at once.
+struct StateLog {
+    int logged = -1, pending = -1;
+    ULONGLONG since = 0;
+    bool changed(int value, ULONGLONG now, ULONGLONG hold_ms) {
+        if (value == logged) return pending = -1, false;
+        if (value != pending) pending = value, since = now;
+        if (logged >= 0 && now - since < hold_ms) return false;
+        logged = value, pending = -1;
+        return true;
+    }
+};
+
+// The window in front when the game isn't: its process file name and window class.
+std::string foreground_window() {
+    const HWND w = GetForegroundWindow();
+    if (!w) return "none";
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    wchar_t cls[128] = {}, path[MAX_PATH] = {};
+    GetClassNameW(w, cls, 128);
+    DWORD size = MAX_PATH;
+    if (HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+        if (!QueryFullProcessImageNameW(p, 0, path, &size)) path[0] = 0;
+        CloseHandle(p);
+    }
+    const wchar_t* file = std::wcsrchr(path, L'\\');
+    return std::format("{} (window class {})", narrow(file ? file + 1 : path), narrow(cls));
+}
+
+// What the "gyro on/off" line can't see: focus, GyroLib's own permission (activation mode, focus, pause, menus,
+// calibration) and the sensor stream. A gyro that stops while GyroUE still says "gyro on" shows up here.
+void log_gyro_changes(bool focused, const gl_gyro_state& gs) {
+    static StateLog focus, enabled, motion, still, source;
+    static uint64_t last_samples = 0;
+    gl_diagnostics d{};
+    gl_get_diagnostics(g_gyro->get(), &d);
+    const ULONGLONG now = GetTickCount64();
+    if (focus.changed(focused, now, 500))
+        log("focus: %s", focused ? "the game window is in front" : ("lost to " + foreground_window()).c_str());
+    if (enabled.changed(gs.enabled != 0, now, 1000))
+        log("gyro: GyroLib %s", gs.enabled ? "enables the gyro"
+                                           : "suspends the gyro (activation mode, focus, pause, menus or calibration)");
+    if (motion.changed(gs.motion_available != 0, now, 1000))
+        log("gyro: motion data %s", gs.motion_available ? "available" : "lost (no controller with a gyro)");
+    if (source.changed(int(d.source), now, 0)) log("gyro: motion source %u", d.source);
+    if (still.changed(d.stationary != 0, now, 3000))
+        log("gyro: the controller %s", d.stationary ? "reads as lying still" : "moves");
+    if (d.accepted_samples < last_samples)
+        log("gyro: GyroLib's sample count restarted (%llu -> %llu): the controller was reopened",
+            (unsigned long long)last_samples, (unsigned long long)d.accepted_samples);
+    last_samples = d.accepted_samples;
+}
+
 void frame() {
     if (!g_gyro && !start_gyro()) {
         g_failed = true;
         return;
     }
     check_settings_file();
+    check_profile_file();
 
     // Settings panel: attach once the game's DX12 swapchain is known. Without a renderer, never
     // leave the (invisible) panel open, or it would hold the gyro suspended.
@@ -1498,13 +1801,18 @@ void frame() {
 
     const Scene s = read_scene();
     engine_check();
+    probe_hotkey(s);
     if (g_probe) probe_keys(s);
-    View* view = active_view(s);
+    auto_probe_watch();
+    View* base = base_view(s);
+    View* view = active_view(s, base);
     if (view) diagnostics(*view, s);
     const uint32_t view_id = view ? view->id : 0;
-    if (view_id != g_last_view) {
-        g_last_view = view_id;
-        log("view: %s (target %s)", view ? view->label.c_str() : "none", ue::name_of(ue::class_of(s.view_target)).c_str());
+    // Logged for the base view; switches between Match=Camera views are logged by camera_match_frame.
+    const uint32_t base_id = base ? base->id : 0;
+    if (base_id != g_last_view) {
+        g_last_view = base_id;
+        log("view: %s (target %s)", base ? base->label.c_str() : "none", ue::name_of(ue::class_of(s.view_target)).c_str());
     }
 
     gl_host_state host{};
@@ -1528,8 +1836,10 @@ void frame() {
     const uint64_t now_ns = SDL_GetTicksNS();
     update_recenter_support(view, s);
     g_recenter_fraction = 0;
-    // The default view reports the active sensitivity profile instead (decided from last frame's buttons).
-    const uint32_t profile = view_id == 1 ? sensitivity_profile() : 0;
+    // The default view (and its Match=Camera views) reports the active sensitivity profile instead (decided from last
+    // frame's buttons).
+    const bool default_view = base_id == 1;
+    const uint32_t profile = default_view ? sensitivity_profile() : 0;
     if (profile != g_last_profile) {
         g_last_profile = profile;
         const char* label = view ? view->label.c_str() : "none";
@@ -1543,7 +1853,7 @@ void frame() {
     // the game as XInput, or when the game reads the controller itself through a checked report layout.
     SDL_Gamepad* pad = xinput::selected_gamepad(g_gyro->get(), g_input->get(), out);
     const bool neutral = panel_has_pad(g_gyro->get(), pad);
-    update_sensitivity_profiles(pad, view_id == 1 && host.camera_allowed && host.focused && !s.paused && !neutral);
+    update_sensitivity_profiles(pad, default_view && host.camera_allowed && host.focused && !s.paused && !neutral);
     xinput::set_neutral(neutral);
     nativepad::set_neutral(neutral);
     // Long-press blocking: the activation button's press is held back from the game, or given to it as a short tap,
@@ -1574,24 +1884,43 @@ void frame() {
         gl_gyro_state gs{};
         gl_get_gyro_state(g_gyro->get(), &gs);
         const bool camera = view && host.camera_allowed && gs.enabled;
+        log_gyro_changes(host.focused, gs);
         g_delivery.on_update(camera, gs.new_samples, yaw != 0 || pitch != 0);
         trace_frame(now_ns, camera, gs.new_samples, out, pitch, yaw);
     }
+    bool write_failed = false;  // the view's rotation couldn't be written (its object is missing)
+    // Match=Camera fast path: did the game put back last frame's write into this view? Its rotation now is also this
+    // frame's "before".
+    int rewritten = -1;
+    double now_pitch = 0, now_yaw = 0;
+    const bool read_back = view && g_match.active() && read_view_rotation(*view, s, now_pitch, now_yaw);
+    if (read_back && g_write_back.view == view->id)
+        rewritten = CameraMatch::rewritten(g_write_back.before, g_write_back.after, now_yaw, g_write_back.written);
+    g_write_back = {};
+    double written_yaw = 0, written_pitch = 0;
     if (view && host.camera_allowed && !probe_capturing() && (yaw != 0 || pitch != 0)) {
         if (apply(*view, s, pitch, yaw)) {
             g_applied_this_frame = true;
             g_applied_yaw += yaw;
             g_applied_pitch += pitch;
             gyro_deg = std::abs(yaw) + std::abs(pitch);
+            written_yaw = yaw, written_pitch = pitch;
+            double after_pitch = 0, after_yaw = 0;
+            if (read_back && read_view_rotation(*view, s, after_pitch, after_yaw))
+                g_write_back = {view->id, now_yaw, after_yaw, yaw};
+        } else {
+            write_failed = true;
+            written_yaw = yaw, written_pitch = pitch;  // lost: carried over to the next view
         }
     }
+    camera_match_frame(s, view, written_yaw, written_pitch, write_failed, rewritten);
     // Recenter after the gyro delta (GyroLib's order); it isn't gyro motion, so the follow check doesn't count it.
     if (g_recenter_fraction > 0 && view && view->id == g_recenter_view && g_recenter_supported && host.camera_allowed &&
         !probe_capturing()) {
         if (apply_recenter(*view, s, g_recenter_fraction)) g_applied_this_frame = true;
         else log("recenter: view %u rotation not written, request dropped", view->id);
     }
-    follow_check(s, view, gyro_deg);
+    follow_check(s, view, gyro_deg > 0 ? std::abs(written_yaw) : 0);
     if (g_probe) auto_probe(s);
 
     const ULONGLONG now = GetTickCount64();
@@ -1617,6 +1946,17 @@ void host_configure(const std::wstring& mod_dir, const std::wstring& exe_stem) {
     xs.touchpad_back = setting(L"XInputTouchpadBack", 1) != 0;
     xs.trace = setting(L"XInputTrace", 0) != 0;
     xinput::install(xs);
+}
+
+void host_raw_input(void* raw_input_handle) {
+    RAWINPUT raw{};
+    UINT size = sizeof(raw);
+    // A HID report doesn't fit (or isn't a mouse): that read fails and is ignored.
+    if (GetRawInputData(static_cast<HRAWINPUT>(raw_input_handle), RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) ==
+        UINT(-1))
+        return;
+    if (raw.header.dwType != RIM_TYPEMOUSE || (raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) return;
+    if (raw.data.mouse.lLastX != 0 || raw.data.mouse.lLastY != 0) g_mouse_moved_at = GetTickCount64();
 }
 
 bool host_frame() {

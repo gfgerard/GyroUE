@@ -83,6 +83,8 @@ Key rules:
   - `host.cpp`: the per-frame logic: GyroLib, scene, views and profiles, camera probe and live test,
     follow check.
   - `ue.cpp`: Unreal memory layout and reflection, and the probe's snapshot/diff.
+  - `profile.cpp`: the game profile's views (read at start and on every file change) and the views the probe adds.
+    `camera_match.hpp`: which `Match=Camera` view the camera follows. Both engine-neutral and unit-tested.
   - `xinput.cpp`: the SDL controller shown to the game as XInput. `nativepad.cpp`: the game's own
     PlayStation pad access (Sony's pad library), for `XInput=2` and native flick stick.
   - `overlay.cpp`: GyroLib's DX12 settings panel. `notify.cpp`: on-screen notices (GDI). `deps.cpp`:
@@ -92,6 +94,7 @@ Key rules:
 - `games/<Game>/`: per-game notes and scripts (git-ignored).
 - `third_party/`: the GyroLib SDK and MinHook (git-ignored; versions in MODLOG).
 - `tools/`: build, package, deploy, benchmark and test tools (see Tooling).
+- `tests/`: unit tests of the engine-neutral parts (`profile_tests.cpp`, target `gyroue_tests`).
 - `bench/`: benchmark method and results.
 - `build/release/`: installable release zips, `GyroUE-v<version>.zip` (git-ignored, like all of `build/`).
 - In a game's `Binaries\Win64`: `winmm.dll` (or `version.dll`) and `GyroUE\` with `gyrolib.dll`,
@@ -108,7 +111,7 @@ Key rules:
   runs its arguments, e.g. `cmd //c 'tools\vsdev.cmd cl /nologo /EHsc foo.cpp'` from Git Bash.
   CMake with the default Visual Studio generator finds MSVC by itself; `-G Ninja` needs `vsdev.cmd`.
 - Python 3.13 and uv are available for helper scripts. git is available; gh is not.
-- Build GyroUE: `bash tools/build-gyroue.sh`. Build + release zip: `bash tools/package-gyroue.sh` (see
+- Build GyroUE: `bash tools/build-gyroue.sh`. Build + unit tests: `bash tools/test-gyroue.sh`. Build + release zip: `bash tools/package-gyroue.sh` (see
   "Releases" below). Install into any UE game:
   `bash tools/deploy-gyroue.sh "<game>\<Project>\Binaries\Win64" [remove]` (installs `winmm.dll`; prefix
   `PROXY=version.dll` to install under that name when `winmm.dll` doesn't load or another mod owns it; Gears of War:

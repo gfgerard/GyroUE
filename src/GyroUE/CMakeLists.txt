@@ -14,7 +14,7 @@ target_include_directories(minhook PUBLIC "${MINHOOK_DIR}/include")
 
 # Version resource (file properties: description, product name, version) from project() above.
 configure_file(version.rc.in "${CMAKE_CURRENT_BINARY_DIR}/version.rc" @ONLY)
-add_library(GyroUE SHARED dllmain.cpp proxy.cpp host.cpp hooks.cpp overlay.cpp perf.cpp ue.cpp log.cpp notify.cpp deps.cpp xinput.cpp nativepad.cpp longpress.cpp proxy.def
+add_library(GyroUE SHARED dllmain.cpp proxy.cpp host.cpp profile.cpp hooks.cpp overlay.cpp perf.cpp ue.cpp log.cpp notify.cpp deps.cpp xinput.cpp nativepad.cpp longpress.cpp proxy.def
             "${CMAKE_CURRENT_BINARY_DIR}/version.rc")
 set_target_properties(GyroUE PROPERTIES OUTPUT_NAME winmm)
 target_compile_definitions(GyroUE PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE "GYROUE_VERSION=\"${PROJECT_VERSION}\"")
@@ -25,3 +25,9 @@ target_link_options(GyroUE PRIVATE /DELAYLOAD:gyrolib.dll)
 # Symbols for crash dumps (build/GyroUE/Release/winmm.pdb; never shipped). /OPT keeps the release layout.
 target_compile_options(GyroUE PRIVATE /Zi)
 target_link_options(GyroUE PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+
+# Unit tests of the engine-neutral parts (game profile, Match=Camera choice): tools/test-gyroue.sh builds and runs them.
+add_executable(gyroue_tests ../../tests/profile_tests.cpp profile.cpp log.cpp)
+target_include_directories(gyroue_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(gyroue_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE "GYROUE_VERSION=\"${PROJECT_VERSION}\"")
+target_compile_options(gyroue_tests PRIVATE /W4 /permissive- /utf-8)

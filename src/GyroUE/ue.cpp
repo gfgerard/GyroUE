@@ -958,6 +958,8 @@ std::string value_string(Obj o, const char* name) {
         if (rd(a, v)) std::snprintf(buffer, sizeof(buffer), "%u", v);
     } else if (p.type == "BoolProperty") {
         return read_bool(o, name, false) ? "true" : "false";
+    } else if (p.type == "NameProperty") {
+        return fname(a);
     } else if (p.type == "StructProperty" && (p.element_size == 12 || p.element_size == 24)) {
         double pitch = 0, yaw = 0, roll = 0;
         if (name_of(struct_type(p)) == "Rotator" && read_rotator(a, p.element_size, pitch, yaw, roll))
@@ -1096,9 +1098,9 @@ bool follows(double p0, double y0, double p, double y, const double now[3], doub
     exact = false;
     if (!std::isfinite(p) || !std::isfinite(y) || !std::isfinite(p0) || !std::isfinite(y0)) return false;
     if (std::abs(p) > 360 || std::abs(y) > 1e5 || near_angle(y0, y)) return false;  // not an angle, or didn't turn
-    if (near_angle(y, now[1]) && std::abs(p - now[0]) <= 0.6) return exact = true;
+    if (near_angle(y, now[1]) && near_angle(p, now[0])) return exact = true;  // pitch 350 = -10 (UE5 keeps 0..360)
     const double tol_y = (std::max)(0.6, std::abs(dy) * 0.03), tol_p = (std::max)(0.6, std::abs(dp) * 0.03);
-    return std::abs(wrap180((y - y0) - dy)) < tol_y && std::abs((p - p0) - dp) < tol_p;
+    return std::abs(wrap180((y - y0) - dy)) < tol_y && std::abs(wrap180((p - p0) - dp)) < tol_p;
 }
 
 void collect_struct(uintptr_t base, Obj st, const std::string& prefix, int depth);
@@ -1436,7 +1438,7 @@ int probe_diff(bool verbose) {
         probe_log("probe: no camera POV rotation, raw diff skipped");
         return 0;
     }
-    const double dp = now[0] - pov->base[0], dy = wrap180(now[1] - pov->base[1]);
+    const double dp = wrap180(now[0] - pov->base[0]), dy = wrap180(now[1] - pov->base[1]);
     probe_log("probe: raw diff, POV pitch %.2f -> %.2f (d %.2f), yaw %.2f -> %.2f (d %.2f)", pov->base[0], now[0], dp,
               pov->base[1], now[1], dy);
     const double kRad = 57.29577951308232;
@@ -1461,11 +1463,11 @@ int probe_diff(bool verbose) {
                     if (!std::isfinite(a) || !std::isfinite(b) || a == b || std::abs(b) > 1e5) continue;
                     const char* what = nullptr;
                     if (near_angle(b, now[1]) && std::abs(dy) > 2) what = "= POV yaw";
-                    else if (std::abs(b - now[0]) < 0.6 && std::abs(dp) > 2) what = "= POV pitch";
+                    else if (near_angle(b, now[0]) && std::abs(dp) > 2) what = "= POV pitch";
                     else if (std::abs(dy) > 2 && near_angle(b - a, dy)) what = "d = POV d yaw";
-                    else if (std::abs(dp) > 2 && std::abs((b - a) - dp) < 0.6) what = "d = POV d pitch";
+                    else if (std::abs(dp) > 2 && near_angle(b - a, dp)) what = "d = POV d pitch";
                     else if (std::abs(dy) > 2 && near_angle(b * kRad, now[1])) what = "= POV yaw (rad)";
-                    else if (std::abs(dp) > 2 && std::abs(b * kRad - now[0]) < 0.6) what = "= POV pitch (rad)";
+                    else if (std::abs(dp) > 2 && near_angle(b * kRad, now[0])) what = "= POV pitch (rad)";
                     if (!what) continue;
                     ++matches;
                     probe_log("  raw %s+0x%zX %s %.4f -> %.4f  %s", r.label.c_str(), off, wide ? "double" : "float", a, b,
@@ -1621,6 +1623,14 @@ std::vector<ProbeGroup> probe_groups() {
 }
 
 void probe_verdict(const std::string& id, int verdict, const std::string& note) { g_verdicts[id] = {verdict, note}; }
+
+void probe_reset() {
+    g_leaves.clear();
+    g_raw.clear();
+    g_candidates.clear();
+    g_verdicts.clear();
+    g_scored_diffs = 0;
+}
 
 std::string probe_suggestion(const std::string& exe_stem, std::string& summary, bool as_profile, bool& verified) {
     summary.clear();
