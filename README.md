@@ -1,3 +1,10 @@
+
+> [!IMPORTANT]
+> This project is being superseeded by [Gyro4All](https://github.com/gfgerard/Gyro4All),
+> for broader game support (not only Unreal Engine) and more features. 
+
+---
+
 # <img src="logo.png" alt="GyroUE logo" width="48px" />GyroUE
 
 ## Introduction
